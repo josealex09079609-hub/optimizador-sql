@@ -17,7 +17,7 @@ import { highlightSql } from '../../core/engine/highlight';
         @if (fileName()) { <button (click)="clip.download(fileName()!, code())">Descargar</button> }
       </div>
     } @else {
-      <div class="scroll"><div class="empty">Analiza un procedimiento para ver este contenido.</div></div>
+      <div class="scroll"><div class="empty">{{ emptyText() }}</div></div>
     }
   `
 })
@@ -28,5 +28,6 @@ export class CodePanelComponent {
   readonly note = input<string | null>(null);
   readonly plain = input(false);
   readonly copyLabel = input('Copiar');
+  readonly emptyText = input('Analiza un procedimiento para ver este contenido.');
   readonly html = computed(() => highlightSql(this.code()));
 }

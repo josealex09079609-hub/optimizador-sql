@@ -11,37 +11,18 @@
   </button>
 </header>
 
-<main>
-  <app-editor />
+<nav class="modes">
+  <div class="mode-tab" [class.on]="store.mode() === 'proc'" (click)="store.mode.set('proc')">
+    📄 Procedimiento <span class="badge">{{ store.proc()?.analysis?.findings?.length ?? 0 }}</span>
+  </div>
+  <div class="mode-tab" [class.on]="store.mode() === 'plan'" (click)="store.mode.set('plan')">
+    📊 Plan de ejecución <span class="badge" [class.bad]="planBad()">{{ planBadge() }}</span>
+  </div>
+</nav>
 
-  <section class="card">
-    <nav class="tabs">
-      @for (t of tabs; track t.id) {
-        <div class="tab" [class.on]="tab() === t.id" (click)="tab.set(t.id)">
-          {{ t.label }}
-          @if (t.id === 'findings') { <span class="badge">{{ store.result()?.analysis?.findings?.length ?? 0 }}</span> }
-        </div>
-      }
-    </nav>
-    <div class="view">
-      @switch (tab()) {
-        @case ('findings') { <app-findings /> }
-        @case ('optimized') { <app-diff-viewer /> }
-        @case ('dictionary') {
-          <app-code-panel [code]="store.dictionary()" [fileName]="store.baseName() + '_DICCIONARIO.sql'" />
-        }
-        @case ('metadata') {
-          <app-code-panel [code]="store.metadata()"
-            note="Si faltan tipos o dependencias (TODO en temporales, funciones, otros PAs), ejecuta estos scripts y usa el resultado para definir tipos exactos (SKILL §0.1)." />
-        }
-        @case ('report') {
-          <app-code-panel [code]="store.report()" [plain]="true" copyLabel="Copiar (para correo a DBA)"
-            [fileName]="store.baseName() + '_REVISION.md'" />
-        }
-      }
-    </div>
-  </section>
-</main>
+<!-- Los dos módulos se mantienen montados para conservar su estado al cambiar de pestaña -->
+<main class="mode" [class.on]="store.mode() === 'proc'"><app-proc-page /></main>
+<main class="mode" [class.on]="store.mode() === 'plan'"><app-plan-page /></main>
 
-<footer>El análisis se ejecuta 100% en el navegador: el código SQL no se envía a ningún servidor.</footer>
+<footer>El análisis se ejecuta 100% en el navegador: el código SQL y el plan no se envían a ningún servidor.</footer>
 @if (clip.toast()) { <div class="toast">{{ clip.toast() }}</div> }

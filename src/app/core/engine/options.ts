@@ -21,5 +21,8 @@ export const OPTIMIZE_OPTIONS: OptionDef[] = [
   { key: 'schema', label: 'Agregar esquema dbo. a tablas', hint: '', default: false },
   { key: 'upper', label: 'Palabras clave en MAYÚSCULAS', hint: 'SKILL §5', default: false },
   { key: 'nocount', label: 'SET NOCOUNT ON (solo PA nuevo)', hint: 'SKILL §6', default: false },
-  { key: 'reviewNotes', label: 'Insertar notas -- [REVISAR]', hint: '', default: false }
+  { key: 'reviewNotes', label: 'Insertar notas -- [REVISAR]', hint: '', default: false },
+  { key: 'planConvert', label: 'Corregir conversiones implícitas con alerta', hint: 'NVARCHAR vs VARCHAR: variable local del tipo de la columna, quitar N\'\' o definir la columna de la temporal como VARCHAR', default: true, group: 'plan' },
+  { key: 'planSort', label: 'Quitar ORDER BY en INSERT a temporal (Sort con spill)', hint: 'Solo si la temporal no tiene IDENTITY ni hay TOP/OFFSET', default: true, group: 'plan' },
+  { key: 'planCode', label: 'Aplicar también el estándar de código (NOLOCK, COUNT(1), INNER JOIN…)', hint: 'Usa las mismas opciones marcadas en Procedimiento', default: true, group: 'plan' }
 ];
