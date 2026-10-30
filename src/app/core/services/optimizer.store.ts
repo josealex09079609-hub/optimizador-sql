@@ -20,7 +20,6 @@ export class OptimizerStore {
   private readonly state = signal<RunState | null>(null);
 
   readonly result = this.state.asReadonly();
-  readonly hasResult = computed(() => this.state() !== null);
   readonly baseName = computed(() => {
     const p = this.state()?.analysis.proc;
     return p ? (p.schema ? p.schema + '.' : '') + p.name : 'script';
@@ -34,12 +33,9 @@ export class OptimizerStore {
     this.state()?.analysis.findings.forEach(f => c[f.sev]++);
     return c;
   });
-  readonly dictionary = computed(() => (this.state() ? Engine.dictionary(this.state()!.src) : ''));
-  readonly metadata = computed(() => (this.state() ? Engine.metadataScripts(this.state()!.src) : ''));
-  readonly report = computed(() => {
-    const s = this.state();
-    return s ? buildReport(s.analysis, s.opt, s.after) : '';
-  });
+  readonly dictionary = computed(() => { const s = this.state(); return s ? Engine.dictionary(s.src) : ''; });
+  readonly metadata = computed(() => { const s = this.state(); return s ? Engine.metadataScripts(s.src) : ''; });
+  readonly report = computed(() => { const s = this.state(); return s ? buildReport(s.analysis, s.opt, s.after) : ''; });
 
   run(): void {
     const src = this.source();
@@ -56,7 +52,7 @@ export class OptimizerStore {
   }
 
   toggleFilter(sev: Severity): void {
-    this.filters.update(f => { const n = new Set(f); n.has(sev) ? n.delete(sev) : n.add(sev); return n; });
+    this.filters.update(f => { const n = new Set(f); if (n.has(sev)) n.delete(sev); else n.add(sev); return n; });
   }
 
   useOptimizedAsInput(): void {

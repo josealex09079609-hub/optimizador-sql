@@ -18,10 +18,11 @@ El análisis se ejecuta **100 % en el navegador**: el código SQL no se envía a
 | **Metadatos** | Scripts §0.1 (dependencias y columnas) para obtener tipos exactos. |
 | **Reporte** | Formato de entrega §8: tabla de cambios, observaciones no aplicadas, contexto faltante, validación. |
 
-Correcciones automáticas (configurables): `WITH (NOLOCK)` según la política del área, `COLLATE` en temporales,
-`DROP TABLE IF EXISTS`, `IN (x)` → `= x`, `;` antes de `THROW`, cierre de transacciones abiertas con TRY/CATCH,
-`SELECT … INTO #` → `CREATE TABLE` + `INSERT INTO`, `JOIN` → `INNER JOIN`, `TRIM`, predicados SARGables,
-eliminación de código comentado (conservando la cabecera), entre otras. Modo claro/oscuro.
+Correcciones automáticas (configurables en `src/app/core/engine/options.ts`): un único `WITH (NOLOCK)` por tabla física (en
+UPDATE/DELETE solo en las tablas unidas, no en la que se modifica), `COUNT(*)` → `COUNT(1)`, `EXISTS (SELECT 1 …)`, `COLLATE` en temporales, `DROP TABLE IF EXISTS`,
+`IN (x)` → `= x`, `;` antes de `THROW`, cierre de transacciones abiertas con TRY/CATCH, `SELECT … INTO #` →
+`CREATE TABLE` + `INSERT INTO`, `JOIN` → `INNER JOIN`, `TRIM`, predicados SARGables y eliminación de código comentado
+(conservando la cabecera). Modo claro/oscuro.
 
 ## Requisitos
 
@@ -42,8 +43,9 @@ npm run build:prod   # salida en dist/sql-optimizer/browser
 ```
 src/app/
 ├── core/
-│   ├── engine/            # Lógica pura (sin Angular): reglas, correcciones, diff, resaltado, reporte
-│   │   ├── sql-engine.ts  # analyze(), optimize(), dictionary(), metadataScripts()
+│   ├── engine/            # Lógica pura (sin Angular)
+│   │   ├── sql-engine.ts  # reglas y correcciones: analyze(), optimize(), dictionary(), metadataScripts()
+│   │   ├── sql-engine.spec.ts
 │   │   ├── diff.ts        # comparación línea a línea + por palabra
 │   │   ├── options.ts     # correcciones automáticas y valores por defecto
 │   │   └── report.ts      # reporte para el DBA (§8)
@@ -56,9 +58,10 @@ src/app/
 └── shared/sample.ts       # Procedimiento de ejemplo
 ```
 
-**Agregar una regla:** en `sql-engine.ts` dentro de `analyze()` usar `add('Rxx', SEV.X, categoría, título, detalle, recomendación, índices, referencia, autofix)`.
-Si tiene corrección automática, agregarla en `fixes`, su metadato en `FIXMETA` y la opción en `options.ts`.
-Toda regla nueva debe respetar la regla de oro y venir de la skill (o ser confirmada).
+**Agregar una regla:** en `sql-engine.ts`, dentro de `analyze()`, usar
+`add('Rxx', SEV.X, categoría, título, detalle, recomendación, índices, referencia, autofix)`.
+Si tiene corrección automática, agregarla en `fixes`, su metadato en `FIXMETA`, la llamada en `optimize()` y la opción en `options.ts`.
+Toda regla nueva debe respetar la regla de oro y llevar su prueba en `sql-engine.spec.ts`.
 
 ## Publicación
 

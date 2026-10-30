@@ -14,14 +14,17 @@ AS
 BEGIN
     DECLARE @MONTOCOL MONEY, @cLista VARCHAR(MAX)
 
+    IF NOT EXISTS (SELECT * FROM dbo.Agencias WITH (NOLOCK) WHERE cAgeCod = @cAgeCod)
+        RETURN
+
     CREATE TABLE #DataCredit (nIdComite INT, cCtaCod VARCHAR(18), cPersNombre VARCHAR(200),)
 
     INSERT INTO #DataCredit (nIdComite, cCtaCod, cPersNombre)
     SELECT cc.nIdComite, ccc.cCtaCod, LTRIM(RTRIM(p.cPersNombre))
     FROM colocComite cc
     INNER JOIN dbo.colocComiteColocacion ccc ON cc.nIdComite = ccc.nIdComite
-    INNER JOIN Persona p WITH(NOLOCK) ON ccc.cPersCodAnalista = p.cPersCod
-    INNER JOIN dbo.Constante t ON cc.nEstado = t.nConsValor AND t.nConsCod = 2009
+    INNER JOIN Persona p WITH(NOLOCK) WITH (NOLOCK) ON ccc.cPersCodAnalista = p.cPersCod
+    INNER JOIN dbo.Constante t (NOLOCK) ON cc.nEstado = t.nConsValor AND t.nConsCod = 2009
     INNER JOIN dbo.Constante t1 ON cc.nTipoComite = t1.nConsValor AND t1.nConsCod = 2010
     INNER JOIN dbo.Constante t2 ON cc.nNivel = t2.nConsValor OR t2.nConsCod = 2011
     INNER JOIN dbo.RRHH rh WITH(NOLOCK) ON p.cPersCod = rh.cPersCod AND LEFT(rh.cRHCod, 1) = 'E'
@@ -33,7 +36,8 @@ BEGIN
     ORDER BY cc.nIdComite DESC
 
     -- SELECT * FROM #DataCredit WHERE nIdComite = 1
-    SELECT d.*, (SELECT cAgeDescripcion FROM dbo.Agencias a WHERE a.cAgeCod = @cAgeCod) cAgencia
+    SELECT d.*, (SELECT cAgeDescripcion FROM dbo.Agencias a WHERE a.cAgeCod = @cAgeCod) cAgencia,
+           (SELECT COUNT(*) FROM #DataCredit) nTotal
     FROM #DataCredit d WITH(NOLOCK)
     WHERE d.cCtaCod NOT IN (SELECT cCtaCod FROM dbo.Producto WHERE nPrdEstado = 2001)
 
@@ -45,6 +49,9 @@ BEGIN
     JOIN dbo.Producto pr WITH(NOLOCK) ON d.cCtaCod = pr.cCtaCod
 
     BEGIN TRAN
-    UPDATE dbo.colocComite SET nEstado = 2 WHERE nIdComite IN (SELECT nIdComite FROM #Pendientes)
+    UPDATE cc SET cc.nEstado = 2
+    FROM dbo.colocComite cc WITH (NOLOCK)
+    INNER JOIN #Pendientes pe WITH (NOLOCK) ON pe.nIdComite = cc.nIdComite
+    INNER JOIN dbo.Agencias ag ON ag.cAgeCod = @cAgeCod
 END
 `;

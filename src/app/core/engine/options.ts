@@ -2,7 +2,9 @@ import { OptionDef } from './models';
 
 /** Correcciones automáticas disponibles. "default" refleja la regla de oro de la skill. */
 export const OPTIMIZE_OPTIONS: OptionDef[] = [
-  { key: 'addNolock', label: 'WITH (NOLOCK) en lecturas (política del área)', hint: 'SKILL §3.1', default: true },
+  { key: 'addNolock', label: 'WITH (NOLOCK): uno por tabla física', hint: 'Agrega donde falta, quita duplicados y (NOLOCK) antiguo; en UPDATE/DELETE solo en las tablas unidas, no en la que se modifica', default: true },
+  { key: 'countOne', label: 'COUNT(*) → COUNT(1)', hint: 'Estándar del área', default: true },
+  { key: 'existsOne', label: 'EXISTS (SELECT …) → SELECT 1', hint: 'IF EXISTS / NOT EXISTS / WHERE EXISTS', default: true },
   { key: 'collateTemp', label: 'COLLATE en texto de temporales', hint: 'SKILL §3.2', default: true },
   { key: 'dropIfExists', label: 'DROP TABLE IF EXISTS', hint: 'SKILL §6', default: true },
   { key: 'singleIn', label: 'IN (x) → = x', hint: 'SKILL §3 – code review senior', default: true },
@@ -11,7 +13,7 @@ export const OPTIMIZE_OPTIONS: OptionDef[] = [
   { key: 'selectInto', label: 'SELECT INTO # → CREATE TABLE', hint: 'SKILL §3.2', default: true },
   { key: 'innerJoin', label: 'JOIN → INNER JOIN', hint: 'Formato', default: true },
   { key: 'trim', label: 'LTRIM(RTRIM()) → TRIM()', hint: 'SKILL §3 – nativas 2019', default: true },
-  { key: 'sarg', label: "LEFT(col,n)='x' → LIKE 'x%'", hint: 'Predicado SARGable', default: true },
+  { key: 'sarg', label: 'LEFT(col,n)=\'x\' → LIKE \'x%\'', hint: 'Predicado SARGable', default: true },
   { key: 'nolockTemp', label: 'Quitar NOLOCK de temporales', hint: 'SKILL §3.1', default: true },
   { key: 'trailingComma', label: 'Corregir coma final en tablas', hint: 'Sintaxis', default: true },
   { key: 'removeComments', label: 'Eliminar código comentado (no la cabecera)', hint: 'SKILL §3', default: true },

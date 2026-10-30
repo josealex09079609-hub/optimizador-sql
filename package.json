@@ -1,6 +1,6 @@
 {
   "name": "sql-optimizer",
-  "version": "1.0.0",
+  "version": "1.2.0",
   "description": "Optimizador de procedimientos almacenados SQL Server 2019 con las buenas prácticas de la UPBD (skill pa-sqlserver-cajaica)",
   "private": true,
   "scripts": {
