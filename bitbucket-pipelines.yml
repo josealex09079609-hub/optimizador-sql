@@ -3,7 +3,7 @@ image: node:20
 pipelines:
   default:
     - step:
-        name: Pruebas y build
+        name: Build
         caches: [node]
         script:
           - npm ci

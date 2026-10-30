@@ -1,7 +1,7 @@
 /**
  * Motor de análisis y optimización T-SQL (SQL Server 2019).
  * Reglas: skill "pa-sqlserver-cajaica" (Manual de Buenas Prácticas UPBD + code review senior + DBA).
- * Lógica pura (sin dependencias de Angular) para poder probarla de forma aislada.
+ * Lógica pura (sin dependencias de Angular): se puede probar de forma aislada.
  */
 import { SqlSpan, AnalysisResult, AppliedChange, Finding, OptimizeOptions, OptimizeResult, ProcInfo } from './models';
 
@@ -67,23 +67,101 @@ const RESERVED = new Set(('SELECT FROM WHERE JOIN INNER LEFT RIGHT FULL CROSS OU
   'ALTER DROP TRUNCATE COMMIT ROLLBACK TRAN TRANSACTION TRY CATCH THROW GO LIKE BETWEEN OVER PARTITION ROWS FETCH NEXT ' +
   'OFFSET ASC DESC INDEX FOR XML PATH').split(' '));
 
+// Hints de tabla reconocidos (WITH (...) o sintaxis antigua (...) sin WITH)
+const TABLE_HINT = /^\s*(NOLOCK|READUNCOMMITTED|READCOMMITTED|READCOMMITTEDLOCK|HOLDLOCK|UPDLOCK|ROWLOCK|PAGLOCK|TABLOCK|TABLOCKX|XLOCK|NOWAIT|READPAST|SERIALIZABLE|REPEATABLEREAD|SNAPSHOT|INDEX|FORCESEEK|FORCESCAN|NOEXPAND|KEEPIDENTITY|KEEPDEFAULTS|IGNORE_CONSTRAINTS|IGNORE_TRIGGERS)\b/i;
+// Hints de bloqueo: si existen, NOLOCK no se agrega (sería contradictorio o daría error)
+const LOCK_HINT = /\b(HOLDLOCK|UPDLOCK|ROWLOCK|PAGLOCK|TABLOCK|TABLOCKX|XLOCK|READPAST|SERIALIZABLE|REPEATABLEREAD|READCOMMITTED|READCOMMITTEDLOCK|SNAPSHOT)\b/i;
+const hasNolockHint = h => !!h && /\b(NOLOCK|READUNCOMMITTED)\b/i.test(h);
+
+// Lee los grupos de hints que siguen a una tabla: WITH (...) y/o (...) antiguo, uno o varios seguidos
+function readHintGroups(masked, pos) {
+  const groups: any[] = [];
+  for (let guard = 0; guard < 6; guard++) {
+    const w = /^\s*(WITH\s*)?\(/i.exec(masked.slice(pos));
+    if (!w) break;
+    const open = pos + w[0].length - 1, close = matchParen(masked, open);
+    if (close < 0) break;
+    const inner = masked.slice(open + 1, close);
+    if (!w[1] && !TABLE_HINT.test(inner)) break; // "(…)" sin WITH solo cuenta si es un hint conocido
+    const start = pos + (w[0].length - w[0].trimStart().length);
+    groups.push({ start, open, close, legacy: !w[1], inner });
+    pos = close + 1;
+  }
+  return { groups, end: pos };
+}
+
 function tableRefs(masked) {
   const refs: any[] = [];
-  const re = /\b(FROM|JOIN)\s+((?:\[?[\w#@]+\]?\s*\.\s*){0,3}\[?[#@]?[\w]+\]?)(\s*\()?(?:\s+(?:AS\s+)?(\[?[A-Za-z_]\w*\]?))?(\s*WITH\s*\(([^)]*)\))?/gi;
+  const re = /\b(FROM|JOIN)\s+((?:\[?[\w#@]+\]?\s*\.\s*){0,3}\[?[#@]?[\w]+\]?)/gi;
   for (const m of allMatches(re, masked)) {
-    if (m[3]) continue;
     const name = m[2].replace(/\s/g, '');
-    const alias = m[4] && !RESERVED.has(m[4].replace(/[\[\]]/g, '').toUpperCase()) ? m[4] : null;
-    let hint = m[5] ? m[6] : null;
-    if (!hint) {
-      const after = masked.slice(m.index + m[0].length, m.index + m[0].length + 40);
-      const h = /^\s*WITH\s*\(([^)]*)\)/i.exec(after);
-      if (h) hint = h[1];
+    const nameIndex = m.index + m[0].length - m[2].length;
+    let pos = m.index + m[0].length;
+    let alias: any = null;
+    // Paréntesis inmediato: función con tabla (TVF) o hint antiguo "dbo.T (NOLOCK)"
+    const p0 = /^\s*\(/.exec(masked.slice(pos));
+    if (p0) {
+      const open = pos + p0[0].length - 1, close = matchParen(masked, open);
+      if (!TABLE_HINT.test(close > 0 ? masked.slice(open + 1, close) : '')) continue; // TVF / función
+    } else {
+      const a = /^\s+(?:AS\s+)?(\[?[A-Za-z_]\w*\]?)/i.exec(masked.slice(pos));
+      if (a && !RESERVED.has(a[1].replace(/[\[\]]/g, '').toUpperCase())) { alias = a[1]; pos += a[0].length; }
     }
-    refs.push({ kw: m[1].toUpperCase(), name, alias, hint, index: m.index, nameIndex: m.index + m[0].indexOf(m[2]),
-      end: m.index + m[0].length, isTemp: /^#|^\[#|^@/.test(name) });
+    const aliasEnd = pos;
+    const hg = readHintGroups(masked, pos);
+    const groups = hg.groups;
+    const hint = groups.length ? groups.map(g => g.inner).join(',') : null;
+    refs.push({ kw: m[1].toUpperCase(), name, alias, hint, groups, legacy: groups.some(g => g.legacy),
+      hintOpen: groups.length ? groups[0].open : -1, hintClose: groups.length ? groups[groups.length - 1].close : -1,
+      aliasEnd, index: m.index, nameIndex, end: hg.end, isTemp: /^#|^\[#|^@/.test(name) });
   }
   return refs;
+}
+
+// ----- Utilidades de hints -----
+const isNolockTok = t => /^\s*(NOLOCK|READUNCOMMITTED)\s*$/i.test(t);
+function hintTokens(groups) { return groups.flatMap(g => splitTop(g.inner).map(t => t.trim()).filter(Boolean)); }
+// Deja un solo NOLOCK (en la posición del primero) y el resto de hints sin cambios
+function dedupeNolock(tokens) {
+  const out: any[] = []; let seen = false;
+  for (const t of tokens) {
+    if (isNolockTok(t)) { if (!seen) { out.push('NOLOCK'); seen = true; } }
+    else if (!out.some(o => o.toUpperCase() === t.toUpperCase())) out.push(t);
+  }
+  return out;
+}
+// ¿Hay que normalizar? varios grupos, sintaxis antigua (NOLOCK) sin WITH o NOLOCK repetido
+function hintNeedsNormalize(groups) {
+  if (!groups.length) return false;
+  const toks = hintTokens(groups);
+  const nl = toks.filter(isNolockTok).length;
+  return groups.length > 1 || nl > 1 || (groups[0].legacy && nl > 0);
+}
+// Edición que reemplaza todos los grupos por un único WITH (...) (o los elimina si queda vacío)
+function hintEdit(src, groups, tokens) {
+  const s0 = groups[0].start, e0 = groups[groups.length - 1].close + 1;
+  if (!tokens.length) {
+    let s1 = s0; while (s1 > 0 && /[ \t]/.test(src[s1 - 1])) s1--;
+    return { start: s1, end: e0, text: '' };
+  }
+  return { start: s0, end: e0, text: `WITH (${tokens.join(', ')})` };
+}
+function applyEdits(src, edits) {
+  edits.sort((a, b) => b.start - a.start);
+  let last = Infinity;
+  for (const e of edits) { if (e.end > last) continue; src = src.slice(0, e.start) + e.text + src.slice(e.end); last = e.start; }
+  return src;
+}
+// Hints en la cabecera del destino: UPDATE dbo.T WITH (NOLOCK) SET … / DELETE dbo.T WITH (NOLOCK) WHERE …
+function dmlHeadHints(masked) {
+  const res: any[] = [];
+  const re = /\b(UPDATE|DELETE)\s+(?:TOP\s*\(\s*\d+\s*\)\s*(?:PERCENT\s+)?)?((?:\[?[\w#@]+\]?\s*\.\s*){0,3}\[?[#@]?\w+\]?)/gi;
+  for (const m of allMatches(re, masked)) {
+    if (/^FROM$/i.test(m[2])) continue;
+    const hg = readHintGroups(masked, m.index + m[0].length);
+    if (hg.groups.length) res.push({ kind: m[1].toUpperCase(), name: m[2], index: m.index, groups: hg.groups, isTemp: /^[#@\[]/.test(m[2]) && /[#@]/.test(m[2]) });
+  }
+  return res;
 }
 
 function stmtContext(masked, idx) {
@@ -172,6 +250,14 @@ function selectIntos(masked) {
   return res;
 }
 // Segmenta sentencias a nivel 0 de paréntesis
+// ¿La referencia es una lectura de tabla física que aún NO tiene NOLOCK?
+function needsNolock(x, masked) {
+  const r = x.ref;
+  if (x.role !== 'read' || r.isTemp) return false;
+  if (hintTokens(r.groups).some(isNolockTok)) return false;   // ya tiene NOLOCK / READUNCOMMITTED
+  if (r.hint && LOCK_HINT.test(r.hint)) return false;          // bloqueo intencional (UPDLOCK, HOLDLOCK…)
+  return !cteSet(masked).has(r.name.replace(/[\[\]]/g, '').toUpperCase());
+}
 function cteSet(masked) { return new Set(allMatches(/(?:\bWITH|,)\s*(\w+)\s*(?:\([^)]*\))?\s+AS\s*\(/gi, masked).map(m => m[1].toUpperCase())); }
 function statements(masked) {
   const toks = allMatches(/\b[A-Za-z_]+\b|[();]/g, masked);
@@ -201,28 +287,39 @@ function statements(masked) {
   return list;
 }
 // Política NOLOCK: read = lleva NOLOCK; target = destino DML; dmlSource = origen de DML hacia tabla física (no lleva NOLOCK)
+// Roles para la política NOLOCK:
+//  read      → lectura de tabla física: lleva un único WITH (NOLOCK)
+//  target    → tabla que se modifica/elimina (UPDATE/DELETE) o destino de INSERT/MERGE: sin NOLOCK
+//  dmlSource → origen de un INSERT/MERGE hacia tabla física: no se agrega NOLOCK
+// En UPDATE/DELETE con JOIN, las tablas unidas y las de subconsultas son "read" (sí llevan NOLOCK).
 function nolockPlan(masked) {
   const refs = tableRefs(masked);
   const sts = statements(masked);
-  const norm = x => (x || '').replace(/[\[\]]/g, '').toUpperCase();
+  const norm = x => (x || '').replace(/[\[\]\s]/g, '').toUpperCase();
+  const depthAt = (from, to) => { let d = 0; for (let i = from; i < to; i++) { if (masked[i] === '(') d++; else if (masked[i] === ')') d--; } return d; };
   return refs.map(r => {
     const st = sts.filter(x => x.start <= r.index && r.index < x.end).pop();
-    let role = 'read';
+    let role = 'read', dml = null;
     if (st && ['INSERT', 'UPDATE', 'DELETE', 'MERGE'].includes(st.type)) {
+      dml = st.type;
       const head = masked.slice(st.start, st.end);
-      const m = /^INSERT\s+(?:INTO\s+)?([^\s(]+)/i.exec(head) || /^UPDATE\s+(?:TOP\s*\(\s*\d+\s*\)\s*)?([^\s(]+)/i.exec(head) ||
-        /^DELETE\s+(?:TOP\s*\(\s*\d+\s*\)\s*)?(?:FROM\s+)?([^\s(]+)/i.exec(head) || /^MERGE\s+(?:INTO\s+)?([^\s(]+)/i.exec(head);
-      let target = m ? norm(m[1]) : '';
+      const m = /^INSERT\s+(?:INTO\s+)?([^\s(]+)/i.exec(head) || /^UPDATE\s+(?:TOP\s*\(\s*\d+\s*\)\s*(?:PERCENT\s+)?)?([^\s(]+)/i.exec(head) ||
+        /^DELETE\s+(?:TOP\s*\(\s*\d+\s*\)\s*(?:PERCENT\s+)?)?(?:FROM\s+)?([^\s(]+)/i.exec(head) || /^MERGE\s+(?:TOP\s*\(\s*\d+\s*\)\s*)?(?:INTO\s+)?([^\s(]+)/i.exec(head);
+      const target = m ? norm(m[1]) : '';
       const inSt = refs.filter(x => x.index >= st.start && x.index < st.end);
       const byAlias = inSt.find(x => x.alias && norm(x.alias) === target);
       const targetName = byAlias ? norm(byAlias.name) : target;
-      const isTarget = norm(r.name) === targetName || (r.alias && norm(r.alias) === target) || norm(r.name).split('.').pop() === targetName.split('.').pop() && targetName !== '';
       const targetTemp = /^[#@]/.test(targetName);
+      const topLevel = depthAt(st.start, r.index) === 0;
+      let isTarget;
+      if (byAlias) isTarget = r === byAlias || (!r.alias && norm(r.name) === target);
+      else isTarget = topLevel && target !== '' && (norm(r.name) === targetName || norm(r.name).split('.').pop() === targetName.split('.').pop());
       if (isTarget && !r.isTemp) role = 'target';
       else if (targetTemp) role = 'read';
+      else if (dml === 'UPDATE' || dml === 'DELETE') role = 'read';
       else role = 'dmlSource';
     }
-    return { ref: r, role };
+    return { ref: r, role, dml };
   });
 }
 const STRING_TYPE = /^(N?VARCHAR|N?CHAR)\b/i;
@@ -240,7 +337,7 @@ function tempStringCols(masked) {
       if (ch === ')' && i < close) depth--;
       if ((ch === ',' && depth === 0) || i === close) {
         const def = masked.slice(pos, i);
-        const lead = def.match(/^\s*/)[0].length;
+        const lead = (def.match(/^\s*/) || [''])[0].length;
         const dm = /^(\[?\w+\]?\s+)(N?VARCHAR|N?CHAR)\b(\s*\(\s*(?:\d+|MAX)\s*\))?/i.exec(def.slice(lead));
         if (dm && !/\bCOLLATE\b/i.test(def) && !/^(CONSTRAINT|PRIMARY|UNIQUE|INDEX)\b/i.test(def.slice(lead)))
           res.push({ at: pos + lead + dm[0].length, col: dm[1].trim(), idx: pos + lead });
@@ -276,6 +373,51 @@ function* oldDropPatterns(src, masked) {
     if (/IS\s+NOT\s+NULL\s+(?:BEGIN\s+)?$/i.test(pre)) continue;
     yield { idx: m.index, len: m[0].length, table: m[1], kind: 'plain' };
   }
+}
+
+const COUNT_STAR = /\bCOUNT\s*\(\s*\*\s*\)/gi;
+const AGG_FN = /\b(COUNT|COUNT_BIG|SUM|MAX|MIN|AVG|STRING_AGG|STDEV|STDEVP|VAR|VARP)\s*\(/i;
+// Quita subconsultas anidadas (SELECT …) para evaluar solo el primer nivel
+function stripSubqueries(t) {
+  let guard = 0, m;
+  while (guard++ < 50 && (m = /\(\s*SELECT\b/i.exec(t))) {
+    const c = matchParen(t, m.index);
+    if (c < 0) break;
+    t = t.slice(0, m.index) + ' 0 ' + t.slice(c + 1);
+  }
+  return t;
+}
+// Analiza cada EXISTS (SELECT … FROM …) y decide si la lista puede pasar a "1"
+function existsSubqueries(masked) {
+  const res: any[] = [];
+  for (const m of allMatches(/\bEXISTS\s*\(\s*SELECT\b/gi, masked)) {
+    const open = masked.indexOf('(', m.index);
+    const close = matchParen(masked, open);
+    if (close < 0) continue;
+    const selEnd = m.index + m[0].length;
+    // FROM / UNION de primer nivel dentro del paréntesis
+    let depth = 0, fromAt = -1, setOp = false;
+    const body = masked.slice(selEnd, close);
+    for (const t of allMatches(/[()]|\b(FROM|UNION|EXCEPT|INTERSECT)\b/gi, body)) {
+      if (t[0] === '(') { depth++; continue; }
+      if (t[0] === ')') { depth--; continue; }
+      if (depth !== 0) continue;
+      const w = t[1].toUpperCase();
+      if (w === 'FROM' && fromAt < 0) fromAt = selEnd + t.index;
+      if (w !== 'FROM') setOp = true;
+    }
+    const listEnd = fromAt >= 0 ? fromAt : -1;
+    const list = listEnd >= 0 ? masked.slice(selEnd, listEnd) : '';
+    const core = list.trim();
+    let status = 'fix', why = '';
+    if (listEnd < 0) { status = 'skip'; why = 'sin FROM'; }
+    else if (core === '1') status = 'ok';
+    else if (setOp) { status = 'skip'; why = 'contiene UNION/EXCEPT/INTERSECT'; }
+    else if (/^TOP\s*\(?\s*(0+|@\w+)\s*\)?/i.test(core)) { status = 'skip'; why = 'TOP 0 / TOP (@variable)'; }
+    else if (AGG_FN.test(stripSubqueries(core)) && !/\bGROUP\s+BY\b/i.test(masked.slice(listEnd, close))) { status = 'agg'; why = 'agregado sin GROUP BY'; }
+    res.push({ idx: m.index, listStart: selEnd, listEnd, list, status, why, isIf: /\bIF\s+(NOT\s+)?$/i.test(masked.slice(Math.max(0, m.index - 12), m.index)) });
+  }
+  return res;
 }
 
 // ---------- Reglas ----------
@@ -332,23 +474,38 @@ export function analyze(src: string): AnalysisResult {
     `${trim.length} ocurrencia(s).`, 'Reemplazar por TRIM(), cumple ambas funciones y mejora la legibilidad.',
     trim.map(m => m.index), 'Manual BP / Observación DBA', true);
 
-  const tmpNl = allMatches(/(#\w+|@\w+)(?:\s+(?:AS\s+)?\w+)?\s+WITH\s*\(\s*NOLOCK\s*\)/gi, masked);
-  if (tmpNl.length) add('R08', SEV.BAJA, 'Hints', 'WITH(NOLOCK) en tablas temporales / variables tabla',
-    'El hint no aporta nada sobre objetos de tempdb o variables tabla.',
-    'Retirar WITH(NOLOCK) de las tablas temporales y variables tipo tabla.',
-    tmpNl.map(m => m.index), 'Observación DBA recurrente', true);
+  const refsNl = tableRefs(masked);
+  const tmpNl = refsNl.filter(r => r.isTemp && hintTokens(r.groups).some(isNolockTok));
+  if (tmpNl.length) add('R08', SEV.BAJA, 'Hints', 'WITH (NOLOCK) en tablas temporales / variables tabla',
+    `Tablas: ${[...new Set(tmpNl.map(r => r.name))].join(', ')}.`,
+    'Las temporales (#) y variables tabla (@) no llevan NOLOCK: el hint no aporta nada sobre tempdb.',
+    tmpNl.map(r => r.index), 'SKILL §3.1 / Observación DBA', true);
 
   const plan = nolockPlan(masked);
-  const noHint = plan.filter(x => x.role === 'read' && !x.ref.isTemp && !x.ref.hint && !cteSet(masked).has(x.ref.name.replace(/[\[\]]/g, '').toUpperCase())).map(x => x.ref);
+  const noHint = plan.filter(x => needsNolock(x, masked)).map(x => x.ref);
   if (noHint.length) add('R09', SEV.MEDIA, 'Concurrencia', 'Lecturas de tablas físicas sin WITH (NOLOCK)',
     `Tablas: ${[...new Set(noHint.map(r => r.name))].join(', ')}.`,
-    'Política del área (lectura sin bloqueo): todo SELECT a tabla física lleva WITH (NOLOCK), incluidas sus JOIN, subconsultas, tablas de otras bases y los orígenes de un INSERT/UPDATE hacia #temporal o @variable tabla.',
-    noHint.map(r => r.index), 'SKILL §3.1 – Política de NOLOCK', true);
-  const badNl = plan.filter(x => (x.role === 'dmlSource' || x.role === 'target') && x.ref.hint && /NOLOCK/i.test(x.ref.hint)).map(x => x.ref);
-  if (badNl.length) add('R50', SEV.ALTA, 'Concurrencia', 'NOLOCK en DML con destino tabla física',
-    `Tablas: ${[...new Set(badNl.map(r => r.name))].join(', ')}.`,
-    'Las tablas origen/destino de un UPDATE/DELETE/INSERT hacia tabla física no deben llevar NOLOCK (se grabarían datos no confirmados). En un PA existente NO se quita automáticamente: reportarlo.',
-    badNl.map(r => r.index), 'SKILL §3.1 – Política de NOLOCK');
+    'Toda tabla física que solo se lee lleva un único WITH (NOLOCK): SELECT, JOIN, subconsultas, otras bases, orígenes hacia #temporal/@tabla y, en UPDATE/DELETE con JOIN, las tablas unidas (no la que se modifica o elimina).',
+    noHint.map(r => r.index), 'Política NOLOCK del área', true);
+
+  const dupNl = plan.filter(x => !x.ref.isTemp && !(x.role === 'target' && (x.dml === 'UPDATE' || x.dml === 'DELETE')) && hintNeedsNormalize(x.ref.groups)).map(x => x.ref);
+  if (dupNl.length) add('R65', SEV.BAJA, 'Hints', 'NOLOCK duplicado o con sintaxis antigua',
+    `Tablas: ${[...new Set(dupNl.map(r => r.name))].join(', ')}.`,
+    'Cada tabla física lleva un solo WITH (NOLOCK). Se unifican hints repetidos (WITH (NOLOCK) WITH (NOLOCK), (NOLOCK) WITH (NOLOCK), NOLOCK + READUNCOMMITTED) y la forma antigua (NOLOCK) sin WITH.',
+    dupNl.map(r => r.index), 'Política NOLOCK del área', true);
+
+  const tgtNl = plan.filter(x => x.role === 'target' && (x.dml === 'UPDATE' || x.dml === 'DELETE') && hintTokens(x.ref.groups).some(isNolockTok)).map(x => x.ref);
+  const headNl = dmlHeadHints(masked).filter(h => !h.isTemp && hintTokens(h.groups).some(isNolockTok));
+  if (tgtNl.length || headNl.length) add('R50', SEV.MEDIA, 'Concurrencia', 'NOLOCK en la tabla que se modifica o elimina',
+    `Tablas: ${[...new Set([...tgtNl.map(r => r.name), ...headNl.map(h => h.name)])].join(', ')}.`,
+    'En UPDATE/DELETE la tabla destino no lleva NOLOCK; solo las tablas unidas que se leen. SQL Server ignora NOLOCK en la tabla destino (o da error 1065 en la cabecera UPDATE … WITH (NOLOCK)), por lo que quitarlo no cambia el resultado.',
+    [...tgtNl.map(r => r.index), ...headNl.map(h => h.index)], 'Política NOLOCK del área', true);
+
+  const insNl = plan.filter(x => (x.dml === 'INSERT' || x.dml === 'MERGE') && (x.role === 'dmlSource' || x.role === 'target') && hintTokens(x.ref.groups).some(isNolockTok)).map(x => x.ref);
+  if (insNl.length) add('R66', SEV.ALTA, 'Concurrencia', 'NOLOCK en INSERT/MERGE hacia tabla física',
+    `Tablas: ${[...new Set(insNl.map(r => r.name))].join(', ')}.`,
+    'Los orígenes de un INSERT/MERGE hacia tabla física no deben llevar NOLOCK (se grabarían datos no confirmados). En un PA existente NO se quita automáticamente: reportarlo.',
+    insNl.map(r => r.index), 'SKILL §3.1 – Política de NOLOCK');
 
   const fnRe = /\b(LEFT|RIGHT|SUBSTRING|CONVERT|CAST|ISNULL|UPPER|LOWER|YEAR|MONTH|DAY|DATEPART|DATEADD|DATEDIFF|LTRIM|RTRIM|TRIM|REPLACE|LEN|COALESCE|FORMAT)\s*\(/gi;
   const nonSarg: any[] = [];
@@ -604,22 +761,18 @@ export function analyze(src: string): AnalysisResult {
     `${rse.length} ocurrencia(s).`,
     'En el CATCH usar THROW; para relanzar el error original (la sentencia anterior debe terminar en ;). Al migrar avisar que cambia el número/severidad (RAISERROR con mensaje daba 50000) y revisar si el llamador depende de ello.',
     rse.map(m => m.index), 'SKILL §3 – Errores con THROW (DBA)');
-  // R52 THROW sin ; previo
   const thr = throwNoSemicolon(masked);
   if (thr.length) add('R52', SEV.ALTA, 'Errores', 'Sentencia previa a THROW sin punto y coma',
     'SQL Server interpreta THROW como alias de la sentencia anterior y falla.', 'Terminar en ; la sentencia anterior a THROW.',
     thr.map(x => x.idx), 'SKILL §3 – Errores con THROW', true);
-  // R53 IN de un solo valor
   const sIn = allMatches(SINGLE_IN, masked);
   if (sIn.length) add('R53', SEV.BAJA, 'Consultas', 'IN / NOT IN con un solo valor',
     `${sIn.length} ocurrencia(s).`, 'Escribir = x / <> x (equivalente también con NULL), respetando el tipo del literal original.',
     sIn.map(m => m.index), 'SKILL §3 – Un solo valor → = / <> (code review senior)', true);
-  // R54 DROP TABLE sin IF EXISTS / IF OBJECT_ID
   const dOld = [...oldDropPatterns(src, masked)];
   if (dOld.length) add('R54', SEV.BAJA, 'Temporales', 'DROP TABLE sin IF EXISTS / patrón IF OBJECT_ID',
     `${dOld.length} ocurrencia(s).`, 'Usar DROP TABLE IF EXISTS #T (varias en una sola sentencia si se quiere).',
     dOld.map(x => x.idx), 'SKILL §3 / §6 – DROP TABLE IF EXISTS', true);
-  // R55 Temporales creadas sin DROP TABLE IF EXISTS al inicio / CATCH
   const tmpsCreated = createdTemps(masked);
   const dropped = new Set(allMatches(/\bDROP\s+TABLE\s+IF\s+EXISTS\s+([#\w\s,]+)/gi, masked).flatMap(m => m[1].split(',').map(x => x.trim().toUpperCase())));
   const notDropped = tmpsCreated.filter(t => !dropped.has(t.toUpperCase()));
@@ -627,18 +780,15 @@ export function analyze(src: string): AnalysisResult {
     notDropped.join(', ') + '.',
     'Limpiar con DROP TABLE IF EXISTS al inicio del PA (antes de los CREATE TABLE), al final dentro del TRY y también en el CATCH antes del THROW. No borrar temporales creadas por el llamador.',
     allMatches(/\bCREATE\s+TABLE\s+#\w+/gi, masked).map(m => m.index), 'SKILL §3.2');
-  // R56 Texto sin COLLATE en temporales
   const tsc = tempStringCols(masked);
   if (tsc.length) add('R56', SEV.MEDIA, 'Temporales', 'Columnas de texto sin COLLATE en temporales / variables tabla',
     `Columnas: ${tsc.map(x => x.col).join(', ')}.`,
     `Toda columna char/varchar/nchar/nvarchar en #temporales y variables tabla lleva COLLATE ${COLL}.`,
     tsc.map(x => x.idx), 'SKILL §3.2 – Collation obligatorio', true);
-  // R57 COLLATE en predicados
   const colP = allMatches(/\bCOLLATE\s+\w+/gi, masked).filter(m => predicateContext(masked, m.index));
   if (colP.length) add('R57', SEV.MEDIA, 'Índices', 'COLLATE en WHERE / JOIN',
     'Impide el uso de índices.', 'No usar COLLATE en predicados (se define en la columna). Si es un JOIN entre bases distintas (DBCMACICA, DBRCC…) NO quitarlo: suele resolver un conflicto real; solo avisar.',
     colP.map(m => m.index), 'SKILL §3 / §6');
-  // R58 CTE no recursivo
   const ctes = allMatches(/(?:\bWITH|,)\s*(\w+)\s*(?:\([^)]*\))?\s+AS\s*\(/gi, masked).filter(m => {
     const open = m.index + m[0].length - 1, close = matchParen(masked, open);
     return close > 0 && !new RegExp('\\b' + m[1] + '\\b', 'i').test(masked.slice(open + 1, close));
@@ -646,27 +796,42 @@ export function analyze(src: string): AnalysisResult {
   if (ctes.length) add('R58', SEV.INFO, 'Temporales', 'CTE no recursivo',
     ctes.map(m => m[1]).join(', ') + '.', 'Preferir tablas temporales declaradas; CTE solo recursivos o casos muy simples de un solo uso. Al reemplazar, verificar mismo resultado.',
     ctes.map(m => m.index), 'SKILL §3.2');
-  // R59 Calif_1..4
   const calif = allMatches(/\bCalif_[1-4]\b/gi, masked);
   if (calif.length) add('R59', SEV.MEDIA, 'Negocio', 'Recalcular calificación con Calif_1..Calif_4',
     '', 'En DBRCC (RCCTOTAL / RCCTOTALULT) usar las columnas Calif20 (calificación ≥ 20) y Calif (calificación > 0) en lugar del CASE sobre Calif_1..Calif_4.',
     calif.map(m => m.index), 'SKILL §3 – DBRCC');
-  // R60 FOR XML para documentos
-  // R61 Contexto faltante: llamadas a otros PAs
   const execs = allMatches(/\bEXEC(?:UTE)?\s+(?!@|\(|sp_executesql|sys\.sp_)((?:\[?\w+\]?\.){0,2}\[?\w+\]?)/gi, masked);
   if (execs.length) add('R61', SEV.INFO, 'Contexto', 'Llama a otros procedimientos',
     [...new Set(execs.map(m => m[1]))].join(', ') + '.', 'No tocar a ciegas lo que depende de esos PAs: pedir su código si el cambio los involucra (regla de oro).',
     execs.map(m => m.index), 'SKILL §0 – Falta de contexto');
 
-  const order = { Alta: 0, Media: 1, Baja: 2, Info: 3 };
+  // R62 COUNT(*) → COUNT(1)
+  const cStar = allMatches(COUNT_STAR, masked);
+  if (cStar.length) add('R62', SEV.BAJA, 'Estándar', 'COUNT(*) en lugar de COUNT(1)',
+    `${cStar.length} ocurrencia(s).`, 'Usar COUNT(1) como estándar del área. Es equivalente: ambos cuentan todas las filas, incluidas las que tienen NULL.',
+    cStar.map(m => m.index), 'Estándar del área', true);
+  // R63 / R64 EXISTS (SELECT 1 …)
+  const exq = existsSubqueries(masked);
+  const exFix = exq.filter(x => x.status === 'fix');
+  if (exFix.length) add('R63', SEV.BAJA, 'Estándar', 'EXISTS sin SELECT 1',
+    `${exFix.length} subconsulta(s) EXISTS / NOT EXISTS con lista de columnas (${exFix.filter(x => x.isIf).length} en IF EXISTS).`,
+    'Escribir IF EXISTS (SELECT 1 FROM … WHERE …). EXISTS solo evalúa si hay filas; la lista de columnas, DISTINCT y TOP n (n ≥ 1) no influyen.',
+    exFix.map(x => x.idx), 'Buena práctica del área', true);
+  const exAgg = exq.filter(x => x.status === 'agg');
+  if (exAgg.length) add('R64', SEV.ALTA, 'Lógica', 'EXISTS con función agregada sin GROUP BY',
+    'Un SELECT COUNT/SUM/MAX… sin GROUP BY devuelve siempre una fila, por lo que el EXISTS siempre es verdadero.',
+    'No se cambia a SELECT 1 automáticamente porque cambiaría el resultado. Revisar la intención: probablemente debía ser IF EXISTS (SELECT 1 FROM … WHERE …) o IF (SELECT COUNT(1) …) > 0.',
+    exAgg.map(x => x.idx), 'Regla de oro – no alterar la lógica');
+
+  const order: Record<string, number> = { Alta: 0, Media: 1, Baja: 2, Info: 3 };
   F.sort((a, b) => order[a.sev] - order[b.sev] || a.id.localeCompare(b.id));
-  const w = { Alta: 6, Media: 3, Baja: 1, Info: 0 };
+  const w: Record<string, number> = { Alta: 6, Media: 3, Baja: 1, Info: 0 };
   const score = Math.max(0, 100 - F.reduce((s, f) => s + w[f.sev], 0));
   return { findings: F, proc, score, stats: { lines: src.split('\n').length, tables: [...new Set(permRefs.map(r => r.name))], temps: [...new Set(refs.filter(r => r.isTemp).map(r => r.name))] } };
 }
 
 // ---------- Correcciones automáticas ----------
-const fixes = {
+const fixes: Record<string, (src: string) => { src: string; count: number }> = {
   trim(src) {
     let count = 0, guard = 0;
     while (guard++ < 500) {
@@ -707,21 +872,22 @@ const fixes = {
     const { masked } = mask(src);
     const ms = allMatches(/\bLEFT\s*\(\s*((?:\[?\w+\]?\.)?\[?[A-Za-z_]\w*\]?)\s*,\s*(\d+)\s*\)\s*=\s*'([^']*)'/gi, masked).reverse();
     for (const m of ms) {
-      const lit = src.slice(m.index, m.index + m[0].length).match(/'([^']*)'\s*$/)[1];
+      const lit = (src.slice(m.index, m.index + m[0].length).match(/'([^']*)'\s*$/) || ['', ''])[1];
       if (lit.length !== +m[2] || /[%_\[]/.test(lit) || / $/.test(lit)) continue;
       src = src.slice(0, m.index) + `${m[1]} LIKE '${lit}%'` + src.slice(m.index + m[0].length); count++;
     }
     return { src, count };
   },
   nolockTemp(src) {
-    let count = 0;
     const { masked } = mask(src);
-    const ms = allMatches(/((?:#\w+|@\w+)(?:\s+(?:AS\s+)?\w+)?)(\s+WITH\s*\(\s*NOLOCK\s*\))/gi, masked).reverse();
-    for (const m of ms) {
-      const s = m.index + m[1].length, e = s + m[2].length;
-      src = src.slice(0, s) + src.slice(e); count++;
+    const edits: any[] = [];
+    for (const r of tableRefs(masked)) {
+      if (!r.isTemp || !r.groups.length) continue;
+      const toks = hintTokens(r.groups);
+      if (!toks.some(isNolockTok)) continue;
+      edits.push(hintEdit(src, r.groups, toks.filter(t => !isNolockTok(t))));
     }
-    return { src, count };
+    return { src: applyEdits(src, edits), count: edits.length };
   },
   nocount(src) {
     const { masked } = mask(src);
@@ -756,19 +922,31 @@ const fixes = {
     }
     return { src, count: cc.length };
   },
+  // Política NOLOCK: exactamente un WITH (NOLOCK) por tabla física que se lee; ninguno en la tabla que se
+  // modifica/elimina en UPDATE/DELETE; las tablas unidas en UPDATE/DELETE sí lo llevan.
   addNolock(src) {
-    let count = 0;
     const { masked } = mask(src);
-    const cte = cteSet(masked);
-    const refs = nolockPlan(masked).filter(x => x.role === 'read' && !x.ref.isTemp && !x.ref.hint).map(x => x.ref);
-    for (const r of refs.reverse()) {
-      if (cte.has(r.name.replace(/[\[\]]/g, '').toUpperCase())) continue;
-      let insertAt;
-      if (r.alias) { const seg = masked.slice(r.nameIndex, r.end); insertAt = r.nameIndex + seg.lastIndexOf(r.alias) + r.alias.length; }
-      else { const mm = /^(?:\[?[\w#@]+\]?\s*\.\s*){0,3}\[?[#@]?\w+\]?/.exec(masked.slice(r.nameIndex)); insertAt = r.nameIndex + (mm ? mm[0].length : r.name.length); }
-      src = src.slice(0, insertAt) + ' WITH (NOLOCK)' + src.slice(insertAt); count++;
+    const edits: any[] = [];
+    for (const x of nolockPlan(masked)) {
+      const r = x.ref;
+      if (r.isTemp) continue;
+      const toks = hintTokens(r.groups);
+      const hasNl = toks.some(isNolockTok);
+      if (needsNolock(x, masked)) {
+        if (!r.groups.length) edits.push({ start: r.aliasEnd, end: r.aliasEnd, text: ' WITH (NOLOCK)' });
+        else edits.push(hintEdit(src, r.groups, dedupeNolock([...toks, 'NOLOCK'])));
+      } else if (x.role === 'target' && (x.dml === 'UPDATE' || x.dml === 'DELETE') && hasNl) {
+        edits.push(hintEdit(src, r.groups, toks.filter(t => !isNolockTok(t))));
+      } else if (hasNl && hintNeedsNormalize(r.groups)) {
+        edits.push(hintEdit(src, r.groups, dedupeNolock(toks)));
+      }
     }
-    return { src, count };
+    for (const h of dmlHeadHints(masked)) {
+      if (h.isTemp) continue;
+      const toks = hintTokens(h.groups);
+      if (toks.some(isNolockTok)) edits.push(hintEdit(src, h.groups, toks.filter(t => !isNolockTok(t))));
+    }
+    return { src: applyEdits(src, edits), count: edits.length };
   },
   schemaPrefix(src) {
     let count = 0;
@@ -877,6 +1055,21 @@ const fixes = {
     for (const x of list) src = src.slice(0, x.at) + ` COLLATE ${COLL}` + src.slice(x.at);
     return { src, count: list.length };
   },
+  countOne(src) {
+    const { masked } = mask(src);
+    const ms = allMatches(COUNT_STAR, masked).reverse();
+    for (const m of ms) src = src.slice(0, m.index) + (src.slice(m.index, m.index + 5) === 'count' ? 'count(1)' : 'COUNT(1)') + src.slice(m.index + m[0].length);
+    return { src, count: ms.length };
+  },
+  existsOne(src) {
+    const { masked } = mask(src);
+    const list = existsSubqueries(masked).filter(x => x.status === 'fix').reverse();
+    for (const x of list) {
+      const trail = (x.list.match(/\s*$/) || [''])[0] || ' ';
+      src = src.slice(0, x.listStart) + ' 1' + trail + src.slice(x.listEnd);
+    }
+    return { src, count: list.length };
+  },
   upperKeywords(src) {
     const KW = new Set(('select from where join inner left right full cross outer on and or group order by having union all insert into update delete set values as with nolock exists in not null is case when then else end begin if while declare exec execute return top distinct apply option merge using output table procedure proc create alter drop truncate commit rollback tran transaction try catch throw like between over partition asc desc count sum max min avg isnull coalesce convert cast trim ltrim rtrim string_agg string_split concat iif getdate nocount int bigint smallint tinyint bit varchar nvarchar char nchar date datetime decimal numeric money print').split(' '));
     const { masked } = mask(src);
@@ -892,7 +1085,7 @@ const fixes = {
   }
 };
 
-const FIXMETA = {
+const FIXMETA: Record<string, string[]> = {
   removeCommentedCode: ['Eliminar lógica SQL comentada (cabecera conservada)', 'SKILL §3 – Comentarios / código muerto', 'Es código que no se ejecuta.'],
   trailingComma: ['Quitar coma final en definición de tabla', 'Error de sintaxis', 'Solo corrige sintaxis; no cambia la estructura.'],
   innerJoin: ['JOIN → INNER JOIN', 'Estándar de formato', 'JOIN sin tipo es INNER JOIN en SQL Server.'],
@@ -907,9 +1100,11 @@ const FIXMETA = {
   sargLeft: ["LEFT(col,n) = 'x' → col LIKE 'x%'", 'Predicado SARGable (Index Seek)', 'Mismo filtro: prefijo exacto de n caracteres.'],
   nolockTemp: ['Quitar WITH (NOLOCK) de temporales', 'SKILL §3.1 – # y @ no llevan NOLOCK', 'El hint no tiene efecto en temporales.'],
   schemaPrefix: ['Agregar esquema dbo.', 'Calificar objetos', 'Mismo objeto si el esquema por defecto es dbo.'],
-  addNolock: ['WITH (NOLOCK) en lecturas de tablas físicas', 'Política del área (lectura sin bloqueo)', 'Solo en lecturas; nunca en destino ni orígenes de DML hacia tabla física.'],
+  addNolock: ['Política WITH (NOLOCK): uno por tabla física', 'Política NOLOCK del área', 'Solo cambia hints: agrega NOLOCK en lecturas que no lo tienen, deja uno solo por tabla y lo quita de la tabla que se modifica en UPDATE/DELETE (SQL Server lo ignora ahí).'],
   nocount: ['SET NOCOUNT ON', 'Solo PA nuevo', 'No aplicar a PA existente.'],
-  upperKeywords: ['Palabras reservadas en MAYÚSCULA', 'SKILL §5 – Formato', 'Solo formato.']
+  upperKeywords: ['Palabras reservadas en MAYÚSCULA', 'SKILL §5 – Formato', 'Solo formato.'],
+  countOne: ['COUNT(*) → COUNT(1)', 'Estándar del área', 'Equivalente: ambos cuentan todas las filas.'],
+  existsOne: ['EXISTS (SELECT …) → EXISTS (SELECT 1 …)', 'Buena práctica del área', 'EXISTS solo evalúa si hay filas; se omiten los casos con agregado sin GROUP BY, UNION o TOP 0.']
 };
 export function optimize(src: string, opts: OptimizeOptions): OptimizeResult {
   const applied: AppliedChange[] = [];
@@ -922,6 +1117,8 @@ export function optimize(src: string, opts: OptimizeOptions): OptimizeResult {
   if (opts.collateTemp) run('collateTemp');
   if (opts.dropIfExists) run('dropIfExists');
   if (opts.singleIn) run('singleIn');
+  if (opts.countOne) run('countOne');
+  if (opts.existsOne) run('existsOne');
   if (opts.trim) run('trim');
   if (opts.stringAgg) run('stringAgg');
   if (opts.sarg) run('sargLeft');

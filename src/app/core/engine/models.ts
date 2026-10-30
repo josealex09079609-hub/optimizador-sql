@@ -39,6 +39,8 @@ export interface OptimizeResult { src: string; applied: AppliedChange[]; }
 
 export interface OptimizeOptions {
   addNolock?: boolean;
+  countOne?: boolean;
+  existsOne?: boolean;
   collateTemp?: boolean;
   dropIfExists?: boolean;
   singleIn?: boolean;
