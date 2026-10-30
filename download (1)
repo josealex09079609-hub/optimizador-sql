@@ -1,0 +1,20 @@
+# Dependencias y compilados
+/node_modules
+/dist
+/out-tsc
+/tmp
+/coverage
+/.angular/cache
+.sass-cache/
+npm-debug.log
+yarn-error.log
+
+# IDEs
+.idea/
+.vscode/*
+!.vscode/extensions.json
+*.iml
+
+# Sistema
+.DS_Store
+Thumbs.db
