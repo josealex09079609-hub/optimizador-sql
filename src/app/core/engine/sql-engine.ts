@@ -1,9 +1,11 @@
 /**
- * Motor de análisis y optimización T-SQL (SQL Server 2019).
+ * Motor de análisis y optimización T-SQL (SQL Server 2019) + análisis de planes de ejecución.
  * Reglas: skill "pa-sqlserver-cajaica" (Manual de Buenas Prácticas UPBD + code review senior + DBA).
  * Lógica pura (sin dependencias de Angular): se puede probar de forma aislada.
  */
-import { SqlSpan, AnalysisResult, AppliedChange, Finding, OptimizeOptions, OptimizeResult, ProcInfo } from './models';
+import { SqlSpan, AnalysisResult, AppliedChange, Finding, OptimizeOptions, OptimizeResult, ProcInfo, PlanAnalysis, ImprovedPlan } from './models';
+
+interface XNode { name: string; attrs: Record<string, string>; children: XNode[] }
 
 // ---------- Utilidades ----------
 export function mask(src: string): { masked: string; comments: SqlSpan[]; strings: SqlSpan[] } {
@@ -98,7 +100,6 @@ function tableRefs(masked) {
     const nameIndex = m.index + m[0].length - m[2].length;
     let pos = m.index + m[0].length;
     let alias: any = null;
-    // Paréntesis inmediato: función con tabla (TVF) o hint antiguo "dbo.T (NOLOCK)"
     const p0 = /^\s*\(/.exec(masked.slice(pos));
     if (p0) {
       const open = pos + p0[0].length - 1, close = matchParen(masked, open);
@@ -121,7 +122,6 @@ function tableRefs(masked) {
 // ----- Utilidades de hints -----
 const isNolockTok = t => /^\s*(NOLOCK|READUNCOMMITTED)\s*$/i.test(t);
 function hintTokens(groups) { return groups.flatMap(g => splitTop(g.inner).map(t => t.trim()).filter(Boolean)); }
-// Deja un solo NOLOCK (en la posición del primero) y el resto de hints sin cambios
 function dedupeNolock(tokens) {
   const out: any[] = []; let seen = false;
   for (const t of tokens) {
@@ -130,14 +130,12 @@ function dedupeNolock(tokens) {
   }
   return out;
 }
-// ¿Hay que normalizar? varios grupos, sintaxis antigua (NOLOCK) sin WITH o NOLOCK repetido
 function hintNeedsNormalize(groups) {
   if (!groups.length) return false;
   const toks = hintTokens(groups);
   const nl = toks.filter(isNolockTok).length;
   return groups.length > 1 || nl > 1 || (groups[0].legacy && nl > 0);
 }
-// Edición que reemplaza todos los grupos por un único WITH (...) (o los elimina si queda vacío)
 function hintEdit(src, groups, tokens) {
   const s0 = groups[0].start, e0 = groups[groups.length - 1].close + 1;
   if (!tokens.length) {
@@ -152,14 +150,13 @@ function applyEdits(src, edits) {
   for (const e of edits) { if (e.end > last) continue; src = src.slice(0, e.start) + e.text + src.slice(e.end); last = e.start; }
   return src;
 }
-// Hints en la cabecera del destino: UPDATE dbo.T WITH (NOLOCK) SET … / DELETE dbo.T WITH (NOLOCK) WHERE …
 function dmlHeadHints(masked) {
   const res: any[] = [];
   const re = /\b(UPDATE|DELETE)\s+(?:TOP\s*\(\s*\d+\s*\)\s*(?:PERCENT\s+)?)?((?:\[?[\w#@]+\]?\s*\.\s*){0,3}\[?[#@]?\w+\]?)/gi;
   for (const m of allMatches(re, masked)) {
     if (/^FROM$/i.test(m[2])) continue;
     const hg = readHintGroups(masked, m.index + m[0].length);
-    if (hg.groups.length) res.push({ kind: m[1].toUpperCase(), name: m[2], index: m.index, groups: hg.groups, isTemp: /^[#@\[]/.test(m[2]) && /[#@]/.test(m[2]) });
+    if (hg.groups.length) res.push({ kind: m[1].toUpperCase(), name: m[2], index: m.index, groups: hg.groups, isTemp: /[#@]/.test(m[2]) });
   }
   return res;
 }
@@ -250,12 +247,11 @@ function selectIntos(masked) {
   return res;
 }
 // Segmenta sentencias a nivel 0 de paréntesis
-// ¿La referencia es una lectura de tabla física que aún NO tiene NOLOCK?
 function needsNolock(x, masked) {
   const r = x.ref;
   if (x.role !== 'read' || r.isTemp) return false;
-  if (hintTokens(r.groups).some(isNolockTok)) return false;   // ya tiene NOLOCK / READUNCOMMITTED
-  if (r.hint && LOCK_HINT.test(r.hint)) return false;          // bloqueo intencional (UPDLOCK, HOLDLOCK…)
+  if (hintTokens(r.groups).some(isNolockTok)) return false;
+  if (r.hint && LOCK_HINT.test(r.hint)) return false;
   return !cteSet(masked).has(r.name.replace(/[\[\]]/g, '').toUpperCase());
 }
 function cteSet(masked) { return new Set(allMatches(/(?:\bWITH|,)\s*(\w+)\s*(?:\([^)]*\))?\s+AS\s*\(/gi, masked).map(m => m[1].toUpperCase())); }
@@ -286,7 +282,6 @@ function statements(masked) {
   list.forEach((st, i) => { st.end = i + 1 < list.length ? list[i + 1].start : masked.length; });
   return list;
 }
-// Política NOLOCK: read = lleva NOLOCK; target = destino DML; dmlSource = origen de DML hacia tabla física (no lleva NOLOCK)
 // Roles para la política NOLOCK:
 //  read      → lectura de tabla física: lleva un único WITH (NOLOCK)
 //  target    → tabla que se modifica/elimina (UPDATE/DELETE) o destino de INSERT/MERGE: sin NOLOCK
@@ -365,7 +360,7 @@ function throwNoSemicolon(masked) {
   }
   return res;
 }
-function* oldDropPatterns(src, masked) {
+function* oldDropPatterns(src: string, masked: string): Generator<any> {
   const re = /\bIF\s+OBJECT_ID\s*\(\s*N?'tempdb\.\.(#\w+)'\s*(?:,\s*N?'U'\s*)?\)\s+IS\s+NOT\s+NULL\s+(?:BEGIN\s+)?DROP\s+TABLE\s+(?:tempdb\.\.)?(#\w+)[ \t]*;?(?:\s*END\b)?/gi;
   for (const m of allMatches(re, src)) if (masked.slice(m.index, m.index + 2).toUpperCase() === 'IF') yield { idx: m.index, len: m[0].length, table: m[1], kind: 'objid' };
   for (const m of allMatches(/\bDROP\s+TABLE\s+(?!IF\s+EXISTS)(#\w+(?:\s*,\s*#\w+)*)/gi, masked)) {
@@ -377,7 +372,6 @@ function* oldDropPatterns(src, masked) {
 
 const COUNT_STAR = /\bCOUNT\s*\(\s*\*\s*\)/gi;
 const AGG_FN = /\b(COUNT|COUNT_BIG|SUM|MAX|MIN|AVG|STRING_AGG|STDEV|STDEVP|VAR|VARP)\s*\(/i;
-// Quita subconsultas anidadas (SELECT …) para evaluar solo el primer nivel
 function stripSubqueries(t) {
   let guard = 0, m;
   while (guard++ < 50 && (m = /\(\s*SELECT\b/i.exec(t))) {
@@ -387,7 +381,6 @@ function stripSubqueries(t) {
   }
   return t;
 }
-// Analiza cada EXISTS (SELECT … FROM …) y decide si la lista puede pasar a "1"
 function existsSubqueries(masked) {
   const res: any[] = [];
   for (const m of allMatches(/\bEXISTS\s*\(\s*SELECT\b/gi, masked)) {
@@ -395,7 +388,6 @@ function existsSubqueries(masked) {
     const close = matchParen(masked, open);
     if (close < 0) continue;
     const selEnd = m.index + m[0].length;
-    // FROM / UNION de primer nivel dentro del paréntesis
     let depth = 0, fromAt = -1, setOp = false;
     const body = masked.slice(selEnd, close);
     for (const t of allMatches(/[()]|\b(FROM|UNION|EXCEPT|INTERSECT)\b/gi, body)) {
@@ -805,12 +797,10 @@ export function analyze(src: string): AnalysisResult {
     [...new Set(execs.map(m => m[1]))].join(', ') + '.', 'No tocar a ciegas lo que depende de esos PAs: pedir su código si el cambio los involucra (regla de oro).',
     execs.map(m => m.index), 'SKILL §0 – Falta de contexto');
 
-  // R62 COUNT(*) → COUNT(1)
   const cStar = allMatches(COUNT_STAR, masked);
   if (cStar.length) add('R62', SEV.BAJA, 'Estándar', 'COUNT(*) en lugar de COUNT(1)',
     `${cStar.length} ocurrencia(s).`, 'Usar COUNT(1) como estándar del área. Es equivalente: ambos cuentan todas las filas, incluidas las que tienen NULL.',
     cStar.map(m => m.index), 'Estándar del área', true);
-  // R63 / R64 EXISTS (SELECT 1 …)
   const exq = existsSubqueries(masked);
   const exFix = exq.filter(x => x.status === 'fix');
   if (exFix.length) add('R63', SEV.BAJA, 'Estándar', 'EXISTS sin SELECT 1',
@@ -1106,8 +1096,10 @@ const FIXMETA: Record<string, string[]> = {
   countOne: ['COUNT(*) → COUNT(1)', 'Estándar del área', 'Equivalente: ambos cuentan todas las filas.'],
   existsOne: ['EXISTS (SELECT …) → EXISTS (SELECT 1 …)', 'Buena práctica del área', 'EXISTS solo evalúa si hay filas; se omiten los casos con agregado sin GROUP BY, UNION o TOP 0.']
 };
-export function optimize(src: string, opts: OptimizeOptions): OptimizeResult {
-  const applied: AppliedChange[] = [];
+export function optimize(src: string, opts: OptimizeOptions, plan?: PlanAnalysis | null): OptimizeResult {
+  const pf = applyPlanFixes(src, plan, opts || {});
+  src = pf.src;
+  const applied = [...pf.applied];
   const run = (key) => { const r = fixes[key](src); if (r.count) { const m = FIXMETA[key]; applied.push({ key, label: `${m[0]} (${r.count})`, count: r.count, motivo: m[1], seguro: m[2] }); } src = r.src; };
   if (opts.removeComments) run('removeCommentedCode');
   if (opts.trailingComma) run('trailingComma');
@@ -1140,7 +1132,7 @@ export function optimize(src: string, opts: OptimizeOptions): OptimizeResult {
     src = lines.join('\n');
     if (Object.keys(notes).length) applied.push({ key: 'notes', label: `Notas -- [REVISAR] insertadas (${Object.keys(notes).length})`, motivo: 'Ayuda de revisión', seguro: 'Solo comentarios.' });
   }
-  return { src, applied };
+  return { src, applied, planFixed: pf.fixed };
 }
 
 export function dictionary(src: string): string {
@@ -1162,4 +1154,738 @@ export function metadataScripts(src: string): string {
   const tables = [...new Set(tableRefs(masked).filter(r => !r.isTemp).map(r => r.name.replace(/[\[\]]/g, '').split('.').pop()))];
   const pn = p ? `${p.schema || 'dbo'}.${p.name}` : '<Esquema>.<NombrePA>';
   return `-- Paso 1: objetos que usa el PA (tablas, funciones, otros PAs, incluso de otras bases)\nSELECT DISTINCT\n    ISNULL(D.referenced_database_name, DB_NAME()) AS cBaseDatos,\n    ISNULL(D.referenced_schema_name, 'dbo') AS cEsquema,\n    D.referenced_entity_name AS cObjeto\nFROM sys.sql_expression_dependencies AS D\nWHERE D.referencing_id = OBJECT_ID(N'${pn}');\n\n-- Paso 2: columnas de esas tablas (ejecutar en cada base del paso 1)\nSELECT\n    C.TABLE_SCHEMA,\n    C.TABLE_NAME,\n    C.COLUMN_NAME,\n    C.DATA_TYPE,\n    C.CHARACTER_MAXIMUM_LENGTH,\n    C.NUMERIC_PRECISION,\n    C.NUMERIC_SCALE,\n    C.IS_NULLABLE,\n    C.COLLATION_NAME\nFROM INFORMATION_SCHEMA.COLUMNS AS C\nWHERE C.TABLE_NAME IN (${tables.length ? tables.map(t => `N'${t}'`).join(', ') : "N'<Tabla1>', N'<Tabla2>'"})\nORDER BY C.TABLE_NAME, C.ORDINAL_POSITION;\n-- CHARACTER_MAXIMUM_LENGTH = -1 significa MAX.\n`;
+}
+
+
+// =====================================================================
+//  PLAN DE EJECUCIÓN (.sqlplan / Showplan XML)
+// =====================================================================
+const XML_ENT: Record<string, string> = { lt: '<', gt: '>', amp: '&', quot: '"', apos: "'" };
+function xmlDecode(s) {
+  return s.replace(/&(#x[0-9a-f]+|#\d+|\w+);/gi, (m, e) => e[0] === '#'
+    ? String.fromCodePoint(e[1] === 'x' || e[1] === 'X' ? parseInt(e.slice(2), 16) : parseInt(e.slice(1), 10))
+    : (XML_ENT[e] !== undefined ? XML_ENT[e] : m));
+}
+// Parser XML mínimo (sin dependencias) suficiente para Showplan
+function parseXml(xml) {
+  const root: XNode = { name: '#root', attrs: {}, children: [] };
+  const stack = [root];
+  const re = /<!--[\s\S]*?-->|<\?[\s\S]*?\?>|<!\[CDATA\[[\s\S]*?\]\]>|<!DOCTYPE[^>]*>|<\/\s*([\w:.-]+)\s*>|<([\w:.-]+)((?:\s+[\w:.-]+\s*=\s*(?:"[^"]*"|'[^']*'))*)\s*(\/?)>/g;
+  let m, count = 0;
+  while ((m = re.exec(xml)) !== null) {
+    if (m[1]) { if (stack.length > 1) stack.pop(); continue; }
+    if (!m[2]) continue;
+    const attrs: Record<string, string> = {};
+    const are = /([\w:.-]+)\s*=\s*(?:"([^"]*)"|'([^']*)')/g; let a;
+    while ((a = are.exec(m[3])) !== null) attrs[a[1].split(':').pop()] = xmlDecode(a[2] !== undefined ? a[2] : a[3]);
+    const node: XNode = { name: m[2].split(':').pop() || '', attrs, children: [] };
+    stack[stack.length - 1].children.push(node); count++;
+    if (!m[4]) stack.push(node);
+  }
+  return { root, count };
+}
+const xAll = (node: any, name: string, out: any[] = []): any[] => { for (const c of node.children) { if (c.name === name) out.push(c); xAll(c, name, out); } return out; };
+const xKid = (node: any, name: string): any => node.children.find(c => c.name === name) || null;
+const xNum = (v: any): number | null => (v === undefined || v === null || v === '' ? null : Number(v));
+const escRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const fmtKB = (kb: number | null) => kb == null ? '—' : kb >= 1048576 ? (kb / 1048576).toFixed(2) + ' GB' : kb >= 1024 ? (kb / 1024).toFixed(1) + ' MB' : Math.round(kb) + ' KB';
+const fmtN = (n: number | null) => n == null ? '—' : Math.round(n).toLocaleString('es-PE');
+
+/** Decodifica los bytes de un .sqlplan (SSMS suele guardarlos en UTF-16). */
+export function decodePlanBytes(bytes: Uint8Array): string {
+  let enc = 'utf-8';
+  if (bytes[0] === 0xFF && bytes[1] === 0xFE) enc = 'utf-16le';
+  else if (bytes[0] === 0xFE && bytes[1] === 0xFF) enc = 'utf-16be';
+  else if (bytes.length > 3 && bytes[1] === 0 && bytes[3] === 0) enc = 'utf-16le';
+  else if (bytes.length > 3 && bytes[0] === 0 && bytes[2] === 0) enc = 'utf-16be';
+  return new TextDecoder(enc).decode(bytes).replace(/^\uFEFF/, '');
+}
+
+// Ubica el texto de una sentencia del plan dentro del procedimiento (ignora espacios y mayúsculas)
+function locateInSource(src, text) {
+  if (!src || !text) return -1;
+  const map: any[] = []; let ns = '';
+  for (let i = 0; i < src.length; i++) {
+    const ch = src[i];
+    if (/\s/.test(ch)) { if (ns.length && ns[ns.length - 1] !== ' ') { ns += ' '; map.push(i); } }
+    else { ns += ch.toUpperCase(); map.push(i); }
+  }
+  const t = text.replace(/\s+/g, ' ').trim().toUpperCase();
+  for (const len of [120, 70, 40]) {
+    const k = t.slice(0, Math.min(len, t.length));
+    if (k.length < 12) break;
+    const p = ns.indexOf(k);
+    if (p >= 0) { let q = map[p]; while (q < src.length && /\s/.test(src[q])) q++; return q; }
+  }
+  return -1;
+}
+
+// "[DB].[dbo].[Tabla].[Col] as [A].[Col]" → partes
+function parseColRef(s) {
+  const [main, alias] = s.split(/\s+as\s+/i);
+  const parts = (main.match(/\[[^\]]*\]/g) || []).map(p => p.slice(1, -1));
+  const aparts = alias ? (alias.match(/\[[^\]]*\]/g) || []).map(p => p.slice(1, -1)) : [];
+  const column = parts[parts.length - 1] || '';
+  const table = (parts.length >= 2 ? parts[parts.length - 2] : '').replace(/_{3,}[0-9A-F]*$/i, '');
+  return { table, column, alias: aparts.length >= 2 ? aparts[aparts.length - 2] : '', db: parts.length >= 4 ? parts[0] : '',
+    isVar: parts.length === 1 && /^@/.test(column), isTemp: /^#/.test(table), isTableVar: /^@/.test(table) };
+}
+const CONV_RE = /CONVERT_IMPLICIT\(\s*([a-z0-9_]+(?:\s*\(\s*(?:\d+|max)\s*(?:,\s*\d+\s*)?\))?)\s*,\s*((?:\[[^\]]*\]\.?)+(?:\s+as\s+(?:\[[^\]]*\]\.?)+)?)\s*,\s*\d+\s*\)/gi;
+
+// Columnas de #temporales y variables tabla: { '#t': { col: {type, typeStart} } }
+function tableColumnDefs(masked) {
+  const res: Record<string, Record<string, any>> = {};
+  for (const m of allMatches(/\b(?:CREATE\s+TABLE\s+(#\w+)|DECLARE\s+(@\w+)\s+(?:AS\s+)?TABLE)\s*\(/gi, masked)) {
+    const name = (m[1] || m[2]).toLowerCase();
+    const open = m.index + m[0].length - 1, close = matchParen(masked, open);
+    if (close < 0) continue;
+    const cols = res[name] = res[name] || {};
+    for (const d of allMatches(/(?:\(|,)\s*\[?(\w+)\]?\s+((?:N?VARCHAR|N?CHAR|VARCHAR|CHAR|\w+)(?:\s*\(\s*(?:\d+|MAX)\s*(?:,\s*\d+\s*)?\))?)/gi, masked.slice(open, close + 1))) {
+      if (/^(CONSTRAINT|PRIMARY|UNIQUE|INDEX)$/i.test(d[1])) continue;
+      const typeStart = open + d.index + d[0].length - d[2].length;
+      cols[d[1].toLowerCase()] = { type: d[2], typeStart, typeEnd: typeStart + d[2].length };
+    }
+  }
+  return res;
+}
+// Variables locales DECLARE @x NVARCHAR(..) (fuera de la cabecera del PA)
+function localDeclares(masked, proc) {
+  const res: Record<string, any> = {};
+  for (const m of allMatches(/(?:\bDECLARE\s+|,\s*)(@\w+)\s+(?:AS\s+)?((?:N?VARCHAR|N?CHAR|\w+)(?:\s*\(\s*(?:\d+|MAX)\s*(?:,\s*\d+\s*)?\))?)/gi, masked)) {
+    if (proc && m.index > proc.index && m.index < (proc.asIndex > 0 ? proc.asIndex : proc.index)) continue;
+    if (/^TABLE$/i.test(m[2])) continue;
+    const typeStart = m.index + m[0].length - m[2].length;
+    res[m[1].toLowerCase()] = { type: m[2], typeStart };
+  }
+  return res;
+}
+function bodyInsertPos(masked, proc) {
+  if (!proc || proc.asIndex < 0) return -1;
+  let pos = proc.asIndex + 2;
+  const b = /^\s*BEGIN\b/i.exec(masked.slice(pos)); if (b) pos += b[0].length;
+  const nc = /^\s*SET\s+NOCOUNT\s+ON\s*;?/i.exec(masked.slice(pos)); if (nc) pos += nc[0].length;
+  return pos;
+}
+// Comparaciones de la columna convertida con otro operando en el código
+function columnComparisons(masked, conv) {
+  const col = escRe(conv.column);
+  const colPat = conv.alias ? `\\b${escRe(conv.alias)}\\s*\\.\\s*\\[?${col}\\]?(?![\\w.])` : `(?<![\\w.@#])(?:\\[?\\w+\\]?\\s*\\.\\s*)?\\[?${col}\\]?(?![\\w.])`;
+  const OPND = String.raw`(@\w+(?![\w.])|N'[^']*'|\[?[#@]?\w+\]?\s*\.\s*\[?\w+\]?)`;
+  const OP = String.raw`\s*(?:=|<>|!=|>=|<=|>|<)\s*`;
+  const res: any[] = [];
+  for (const m of allMatches(new RegExp(colPat + OP + OPND, 'gi'), masked)) res.push({ other: m[1], otherIdx: m.index + m[0].length - m[1].length, idx: m.index });
+  for (const m of allMatches(new RegExp(OPND + OP + colPat, 'gi'), masked)) res.push({ other: m[1], otherIdx: m.index, idx: m.index });
+  return res;
+}
+// Ediciones que eliminan una conversión implícita (solo casos equivalentes: unicode → no unicode)
+function convertEdits(src, masked, conv, extParams?: any[]) {
+  const out: { edits: any[]; decls: any[]; notes: string[] } = { edits: [], decls: [], notes: [] };
+  if (!/^n(var)?char/i.test(conv.type)) return out;
+  const proc = parseProc(src, masked);
+  const declared = localDeclares(masked, proc);
+  const tdefs = tableColumnDefs(masked);
+  const refs = tableRefs(masked);
+  const seen = new Set();
+  for (const c of columnComparisons(masked, conv)) {
+    const o = c.other.replace(/\s+/g, '');
+    if (o[0] === '@' && !o.includes('.')) {
+      const p = (proc && proc.params.find(x => x.name.toLowerCase() === o.toLowerCase())) || (!proc && extParams ? extParams.find(x => x.name.toLowerCase() === o.toLowerCase()) : null);
+      if (p && /^N(VAR)?CHAR/i.test(p.type)) {
+        const local = o + 'Local';
+        out.edits.push({ start: c.otherIdx, end: c.otherIdx + o.length, text: local });
+        if (!out.decls.some(d => d.name === local)) out.decls.push({ name: local, type: p.type.replace(/^N/i, '').toUpperCase(), param: o });
+        out.notes.push(`variable local ${local} ${p.type.replace(/^N/i, '').toUpperCase()} (sin cambiar la firma)`);
+      } else if (declared[o.toLowerCase()] && /^N(VAR)?CHAR/i.test(declared[o.toLowerCase()].type)) {
+        const d = declared[o.toLowerCase()];
+        if (!seen.has(d.typeStart)) { seen.add(d.typeStart); out.edits.push({ start: d.typeStart, end: d.typeStart + 1, text: '' }); out.notes.push(`${o} declarada como ${d.type.slice(1).toUpperCase()}`); }
+      }
+    } else if (/^N'/i.test(o)) {
+      const lit = src.slice(c.otherIdx, c.otherIdx + c.other.length);
+      if (/^N'[\x00-\xFF]*'$/i.test(lit)) { out.edits.push({ start: c.otherIdx, end: c.otherIdx + 1, text: '' }); out.notes.push(`literal ${lit.slice(1)} sin prefijo N`); }
+    } else {
+      const [al, cn] = o.split('.').map(x => x.replace(/[\[\]]/g, ''));
+      const ref = refs.find(r => (r.alias && r.alias.replace(/[\[\]]/g, '').toLowerCase() === al.toLowerCase()) || r.name.replace(/[\[\]]/g, '').toLowerCase() === al.toLowerCase());
+      const tname = ref ? ref.name.replace(/[\[\]]/g, '').toLowerCase() : (/^[#@]/.test(al) ? al.toLowerCase() : '');
+      const def = tname && tdefs[tname] && tdefs[tname][cn.toLowerCase()];
+      if (def && /^N(VAR)?CHAR/i.test(def.type) && !seen.has(def.typeStart)) {
+        seen.add(def.typeStart);
+        out.edits.push({ start: def.typeStart, end: def.typeStart + 1, text: '' });
+        out.notes.push(`${tname}.${cn} definida como ${def.type.slice(1).toUpperCase()}`);
+      }
+    }
+  }
+  return out;
+}
+function applyConvert(src, conv, extParams?: any[]) {
+  const { masked } = mask(src);
+  const r = convertEdits(src, masked, conv, extParams);
+  if (!r.edits.length) return { src, count: 0, notes: [] };
+  const proc = parseProc(src, masked);
+  const edits = [...r.edits];
+  const pos = bodyInsertPos(masked, proc);
+  const newDecl = r.decls.filter(d => !new RegExp('\\bDECLARE\\s+' + escRe(d.name) + '\\b', 'i').test(masked));
+  if (newDecl.length) {
+    if (!proc) edits.push({ start: 0, end: 0, text: newDecl.map(d => `DECLARE ${d.name} ${d.type} = ${d.param}; -- Plan: evita CONVERT_IMPLICIT sobre ${conv.table}.${conv.column} (validar tipo exacto de la columna)\n`).join('') });
+    else if (pos < 0) return { src, count: 0, notes: [] };
+    else edits.push({ start: pos, end: pos, text: newDecl.map(d => `\n    DECLARE ${d.name} ${d.type} = ${d.param}; -- Plan: evita CONVERT_IMPLICIT sobre ${conv.table}.${conv.column} (validar tipo exacto de la columna)`).join('') });
+  }
+  return { src: applyEdits(src, edits), count: 1, notes: r.notes };
+}
+
+// Quita ORDER BY de un INSERT INTO #temporal cuyo Sort aparece en el plan
+function insertOrderByEdit(src, masked, at, sortCols) {
+  const st = statements(masked).filter(x => x.start <= at && at < x.end).pop();
+  if (!st || st.type !== 'INSERT') return null;
+  const body = masked.slice(st.start, st.end);
+  const tm = /^INSERT\s+(?:INTO\s+)?(#\w+)/i.exec(body);
+  if (!tm) return null;
+  let depth = 0, ob = -1, stop = -1;
+  for (const t of allMatches(/[()]|\bORDER\s+BY\b|\bTOP\b|\bOFFSET\b|\bOPTION\b/gi, body)) {
+    if (t[0] === '(') { depth++; continue; }
+    if (t[0] === ')') { depth--; continue; }
+    if (depth !== 0) continue;
+    const w = t[0].toUpperCase();
+    if (w === 'TOP' || w === 'OFFSET') return null;
+    if (/^ORDER/.test(w)) ob = t.index;
+    if (w === 'OPTION' && ob >= 0) stop = t.index;
+  }
+  if (ob < 0) return null;
+  const def = new RegExp('\\bCREATE\\s+TABLE\\s+' + escRe(tm[1]) + '\\s*\\(', 'i').exec(masked);
+  if (def) { const c = matchParen(masked, def.index + def[0].length - 1); if (/\bIDENTITY\b/i.test(masked.slice(def.index, c))) return null; }
+  if (new RegExp('\\bALTER\\s+TABLE\\s+' + escRe(tm[1]) + '\\b[^;]*\\bIDENTITY\\b', 'i').test(masked)) return null;
+  let end = stop >= 0 ? stop : body.length;
+  const clause = body.slice(ob, end);
+  if (sortCols && sortCols.length && !sortCols.some(c => new RegExp('\\b' + escRe(c) + '\\b', 'i').test(clause))) return null;
+  let s0 = st.start + ob; while (s0 > 0 && /\s/.test(masked[s0 - 1])) s0--;
+  let e0 = st.start + end; while (e0 > s0 && /\s/.test(masked[e0 - 1])) e0--;
+  if (masked[e0 - 1] === ';') e0--;
+  return { start: s0, end: e0, text: '' };
+}
+// VARCHAR(MAX) en temporales / variables tabla → VARCHAR(2000) (sobreestimación de memoria)
+function maxColumnEdits(masked) {
+  const edits: any[] = [];
+  for (const [, cols] of Object.entries(tableColumnDefs(masked)))
+    for (const d of Object.values(cols))
+      if (/^N?VARCHAR\s*\(\s*MAX\s*\)$/i.test(d.type))
+        edits.push({ start: d.typeStart, end: d.typeEnd, text: d.type.replace(/\(\s*MAX\s*\)/i, '(2000)') + ' /* TODO: validar longitud máxima real (plan: sobreestimación de memoria) */' });
+  return edits;
+}
+
+// ---------- Propuestas de mejora del plan ----------
+function planTables(node) {
+  const out = new Map<string, any>();
+  for (const o of xAll(node, 'Object')) {
+    const t = (o.attrs.Table || '').replace(/[\[\]]/g, '').replace(/_{3,}[0-9A-F]*$/i, '');
+    if (!t || /^[#@]/.test(t) || /tempdb/i.test(o.attrs.Database || '')) continue;
+    const sch = (o.attrs.Schema || '[dbo]').replace(/[\[\]]/g, '');
+    const db = (o.attrs.Database || '').replace(/[\[\]]/g, '');
+    out.set(`${db}.${sch}.${t}`.toLowerCase(), { schema: sch, table: t, db });
+  }
+  return [...out.values()];
+}
+function statsScript(tables) {
+  return tables.map(t => `${t.db ? `USE [${t.db}];\n` : ''}UPDATE STATISTICS [${t.schema}].[${t.table}] WITH FULLSCAN;`).join('\n');
+}
+function parentMap(root) {
+  const m = new Map<any, any>();
+  (function walk(n) { for (const c of n.children) { m.set(c, n); walk(c); } })(root);
+  return m;
+}
+/** Fragmento "-- Antes / -- Después" con solo las líneas que cambian. */
+function changedSnippet(a, b) {
+  if (a === b) return '';
+  const A = a.replace(/\r/g, '').split('\n'), B = b.replace(/\r/g, '').split('\n');
+  const sa = new Set(A.map(x => x.trim())), sb = new Set(B.map(x => x.trim()));
+  const del = A.filter(x => x.trim() && !sb.has(x.trim())).slice(0, 8);
+  const ad = B.filter(x => x.trim() && !sa.has(x.trim())).slice(0, 10);
+  const dedent = (t: string[]) => { if (!t.length) return t; const ind = Math.min(...t.map(x => (x.match(/^\s*/) || [''])[0].length)); return t.map(x => x.slice(ind)); };
+  return `-- Antes\n${dedent(del).join('\n') || '(sin líneas eliminadas)'}\n-- Después\n${dedent(ad).join('\n') || '(se elimina)'}`;
+}
+const idxName = (t, cols) => `IX_${t}_${cols.map(c => c.replace(/[\[\]]/g, '')).slice(0, 3).join('_')}`;
+
+/**
+ * Analiza un Showplan XML. Si se envía el código del PA, ubica cada hallazgo en sus líneas
+ * y calcula qué correcciones se pueden aplicar.
+ */
+export function analyzePlan(xml: string, src?: string): PlanAnalysis {
+  const F: Finding[] = [];
+  const res: PlanAnalysis = { ok: false, error: '', build: '', isActual: false, statements: [], findings: F, missingIndexes: [], fixes: { converts: [], convertsAll: [], sorts: [], excessiveGrant: false } };
+  if (!xml || !xml.trim()) { res.error = 'Plan vacío.'; return res; }
+  let doc: { root: XNode; count: number };
+  try { doc = parseXml(xml); } catch (e) { res.error = 'No se pudo leer el XML.'; return res; }
+  const showplan = xAll(doc.root, 'ShowPlanXML')[0];
+  if (!showplan) { res.error = 'El archivo no es un plan de ejecución de SQL Server (falta <ShowPlanXML>). Guárdalo desde SSMS con "Guardar plan de ejecución como…" (.sqlplan).'; return res; }
+  res.ok = true;
+  res.build = showplan.attrs.Build || '';
+  src = src || '';
+  const masked = src ? mask(src).masked : '';
+  const add = (key, id, sev, cat, title, detail, rec, lines, ref, autofix = false, extra = {}) =>
+    F.push(Object.assign({ key, id, sev, cat, title, detail, rec, lines: uniq(lines.filter(l => l > 0)), ref, autofix, source: 'plan' as const }, extra));
+  const sts = src ? statements(masked) : [];
+  const colLines = (names, at) => {
+    if (!src || !names.length || at < 0) return [];
+    const st = sts.filter(x => x.start <= at && at < x.end).pop();
+    if (!st) return [];
+    const seg = masked.slice(st.start, st.end), out: any[] = [];
+    for (const n of names) for (const m of allMatches(new RegExp('\\b' + escRe(n) + '\\b', 'gi'), seg)) out.push(lineOf(src, st.start + m.index));
+    return out;
+  };
+
+  const stmts = xAll(showplan, 'StmtSimple').filter(s => xKid(s, 'QueryPlan'));
+  stmts.forEach((s, si) => {
+    const qp = xKid(s, 'QueryPlan');
+    const a = s.attrs;
+    const n = si + 1;
+    const text = (a.StatementText || '').trim();
+    const at = locateInSource(src, text);
+    const line = at >= 0 ? lineOf(src, at) : 0;
+    const L = line ? [line] : [];
+    const short = text.replace(/\s+/g, ' ').slice(0, 90) + (text.length > 90 ? '…' : '');
+    const where = `Sentencia ${n}${line ? ` (línea ${line})` : ''}`;
+    const mg = xKid(qp, 'MemoryGrantInfo');
+    const g = mg ? mg.attrs : {};
+    const qts = xKid(qp, 'QueryTimeStats');
+    const st: any = { n, type: a.StatementType || '', text: short, fullText: text, line, at, cost: xNum(a.StatementSubTreeCost), estRows: xNum(a.StatementEstRows),
+      grantedKB: xNum(g.GrantedMemory), usedKB: xNum(g.MaxUsedMemory), desiredKB: xNum(g.SerialDesiredMemory) ?? xNum(qp.attrs.MemoryGrant),
+      waitMs: xNum(g.GrantWaitTime), elapsedMs: qts ? xNum(qts.attrs.ElapsedTime) : null, cpuMs: qts ? xNum(qts.attrs.CpuTime) : null,
+      dop: xNum(qp.attrs.DegreeOfParallelism), spills: 0, converts: 0, warnings: 0, timeout: a.StatementOptmEarlyAbortReason === 'TimeOut' };
+    const pl = xKid(qp, 'ParameterList');
+    st.params = pl ? pl.children.filter(c => c.name === 'ColumnReference' && c.attrs.Column).map(c => ({
+      name: c.attrs.Column, type: (c.attrs.ParameterDataType || '').toUpperCase(),
+      compiled: c.attrs.ParameterCompiledValue, runtime: c.attrs.ParameterRuntimeValue })) : [];
+    res.statements.push(st);
+    const parents = parentMap(qp);
+    const stTables = planTables(qp);
+
+    // --- Parameter sniffing ---
+    const sniff = st.params.filter(p => p.compiled != null && p.runtime != null && p.compiled !== p.runtime);
+    if (sniff.length) add(`P14|${n}`, 'P14', 'Media', 'Plan · Parámetros', 'Plan compilado con otros valores de parámetros (parameter sniffing)',
+      `${where}: ${sniff.map(p => `${p.name} compilado con ${p.compiled} y ejecutado con ${p.runtime}`).join('; ')}.`,
+      'Si el rendimiento cambia mucho según el valor, el plan reutilizado no es el adecuado para todos los casos.', L, 'Plan – ParameterCompiledValue vs ParameterRuntimeValue', false,
+      { stmt: n, proposal: { text: 'Comparar el plan con ambos valores. Si los volúmenes son muy distintos, separar en consultas por escenario (IF … ELSE) para que cada una tenga su plan. No agregar OPTION (RECOMPILE) ni OPTIMIZE FOR sin aprobación del DBA (SKILL: sin hints).' } });
+
+    // --- RelOps ---
+    const relops = xAll(qp, 'RelOp');
+    const actualOf = r => {
+      const rti = xKid(r, 'RunTimeInformation');
+      if (!rti) return null;
+      res.isActual = true;
+      let rows = 0, execs = 0, read = 0, hasRead = false;
+      for (const t of rti.children.filter(c => c.name === 'RunTimeCountersPerThread')) {
+        rows += xNum(t.attrs.ActualRows) || 0; execs = Math.max(execs, xNum(t.attrs.ActualExecutions) || 0);
+        if (t.attrs.ActualRowsRead !== undefined) { hasRead = true; read += xNum(t.attrs.ActualRowsRead) || 0; }
+      }
+      return { rows, execs, read: hasRead ? read : null };
+    };
+    const opCols = r => {
+      const cols = new Set();
+      for (const c of xAll(r, 'ColumnReference')) if (c.attrs.Column && !/^(@|Expr|Bmk|Chk|Uniq)/i.test(c.attrs.Column)) cols.add(c.attrs.Column);
+      return [...cols];
+    };
+    const deviations: any[] = [];
+    for (const r of relops) {
+      const ra = r.attrs, op = ra.PhysicalOp || '', node = ra.NodeId;
+      const act = actualOf(r);
+      const est = xNum(ra.EstimateRows);
+      const w = xKid(r, 'Warnings');
+      // Spills
+      if (w) {
+        const spill = xKid(w, 'SpillToTempDb');
+        const sd = xKid(w, 'SortSpillDetails') || xKid(w, 'HashSpillDetails') || xKid(w, 'ExchangeSpillDetails');
+        if (spill || sd) {
+          st.spills++;
+          let cols: any[] = [];
+          if (op.includes('Sort')) { const ob = xAll(r, 'OrderBy')[0]; if (ob) cols = xAll(ob, 'ColumnReference').map(c => c.attrs.Column).filter(Boolean); }
+          else if (op.includes('Hash')) { const hk = xAll(r, 'HashKeysBuild')[0] || xAll(r, 'HashKeysProbe')[0]; if (hk) cols = xAll(hk, 'ColumnReference').map(c => c.attrs.Column).filter(Boolean); }
+          const sda = sd ? sd.attrs : {};
+          const det = `${where}: ${op} (nodo ${node}) derramó a tempdb${spill && spill.attrs.SpillLevel ? ` — nivel ${spill.attrs.SpillLevel}` : ''}` +
+            `${sda.WritesToTempDb ? `, ${fmtN(xNum(sda.WritesToTempDb))} páginas escritas` : ''}` +
+            `${sda.GrantedMemoryKb ? `. Memoria del operador: ${fmtKB(xNum(sda.GrantedMemoryKb))} concedidos / ${fmtKB(xNum(sda.UsedMemoryKb))} usados` : ''}` +
+            `${act && est != null ? `. Filas estimadas ${fmtN(est * Math.max(1, act.execs))} vs reales ${fmtN(act.rows)}` : ''}.`;
+          let fixable = false;
+          if (op === 'Sort' && src && at >= 0 && /^INSERT$/i.test(st.type)) fixable = !!insertOrderByEdit(src, masked, at, cols);
+          let snip = '';
+          if (op === 'Sort' && /^INSERT/i.test(st.type)) { const e = insertOrderByEdit(text, mask(text).masked, 0, cols); if (e) snip = changedSnippet(text, applyEdits(text, [e])); }
+          if (op === 'Sort') res.fixes.sorts.push({ at, cols, stmt: n, node, key: `P01|${n}|${node}` });
+          const spT = planTables(r);
+          const proposal = op === 'Sort' && snip
+            ? { text: 'Quitar el ORDER BY del INSERT a la temporal: el orden de inserción no se garantiza y elimina el Sort que derrama. Ordenar solo en el SELECT final.', sql: snip }
+            : { text: `Reducir las filas que llegan al ${op} (filtrar antes en una #temporal, sin columnas innecesarias) y actualizar estadísticas de las tablas que alimentan la estimación (${fmtN(est)} estimadas).`, sql: statsScript(spT) };
+          const rec = op.includes('Sort')
+            ? 'El Sort no tuvo memoria suficiente (estimación de filas baja). ' + (fixable ? 'Se quita el ORDER BY del INSERT a la temporal (el orden de inserción no se garantiza y la temporal no tiene IDENTITY). ' : 'Evitar ordenar si no es necesario (ordenar solo en el SELECT final). ') + 'Filtrar antes de ordenar, actualizar estadísticas de las tablas involucradas y corregir predicados no SARGables o conversiones que distorsionan la estimación.'
+            : op.includes('Hash') ? 'El Hash Match no tuvo memoria suficiente: reducir filas antes del JOIN/GROUP BY (filtrar primero en una temporal), corregir estimaciones (estadísticas, conversiones implícitas, funciones sobre columnas) y evaluar un índice que permita Nested Loops / Merge.'
+            : 'Spill en un operador de paralelismo: revisar el desbalance de filas entre hilos y las estimaciones; normalmente se corrige al mejorar la estimación de filas.';
+          add(`P01|${n}|${node}`, 'P01', 'Alta', 'Plan · Spill (crítico)', `⚠ Spill a tempdb en ${op}`, det, rec, L, 'Plan real – SpillToTempDb', fixable || !!snip, { stmt: n, proposal });
+        }
+        if (w.attrs.NoJoinPredicate === 'true' || w.attrs.NoJoinPredicate === '1') {
+          st.warnings++;
+          add(`P10|${n}|${node}`, 'P10', 'Alta', 'Plan · Lógica', 'JOIN sin predicado (producto cartesiano)', `${where}: ${op} (nodo ${node}) sin condición de unión.`,
+            'Revisar las condiciones ON / JOIN implícitos con comas: falta relacionar tablas. Verificar que el resultado esperado no dependa del producto cartesiano.', L, 'Plan – NoJoinPredicate', false,
+            { stmt: n, proposal: { text: 'Escribir todos los JOIN con INNER JOIN … ON y relacionar cada tabla con su clave. Si el producto cartesiano es intencional (p. ej. una sola fila de parámetros), usar CROSS JOIN explícito.' } });
+        }
+        const cns = xKid(w, 'ColumnsWithNoStatistics');
+        if (cns) {
+          const crefs = xAll(cns, 'ColumnReference');
+          const cols = crefs.map(c => `${(c.attrs.Table || '').replace(/[\[\]]/g, '')}.${c.attrs.Column}`);
+          const sql = crefs.map(c => { const t = (c.attrs.Table || '').replace(/[\[\]]/g, ''), sc = (c.attrs.Schema || '[dbo]').replace(/[\[\]]/g, ''), cn = (c.attrs.Column || '').replace(/[\[\]]/g, '');
+            return `CREATE STATISTICS ST_${t}_${cn} ON [${sc}].[${t}] ([${cn}]) WITH FULLSCAN;`; }).join('\n');
+          add(`P12|${n}|${node}`, 'P12', 'Baja', 'Plan · Estadísticas', 'Columnas sin estadísticas', `${where}: ${cols.join(', ')}.`,
+            'Sin estadísticas el optimizador adivina la cantidad de filas.', L, 'Plan – ColumnsWithNoStatistics', false,
+            { stmt: n, proposal: { text: 'Crear las estadísticas (validar con el DBA si AUTO_CREATE_STATISTICS está desactivado):', sql } });
+        }
+      }
+      // Key / RID Lookup
+      if (/^(Key Lookup|RID Lookup)$/.test(op)) {
+        const obj = xAll(r, 'Object')[0];
+        const tbl = obj ? (obj.attrs.Table || '').replace(/[\[\]]/g, '') : '';
+        const execs = act ? act.execs : (xNum(ra.EstimateRebinds) || 0) + (xNum(ra.EstimateRewinds) || 0) + 1;
+        if ((execs || 0) >= 1000 || (act && act.rows >= 1000)) {
+          const cols = opCols(xKid(r, 'OutputList') || r);
+          // Índice usado por el operador hermano (Seek/Scan) del Nested Loops
+          let par = parents.get(r); while (par && par.name !== 'RelOp' && parents.get(par)) par = parents.get(par);
+          const sameT = x => { const o = xAll(x, 'Object')[0]; return o && (o.attrs.Table || '').replace(/[\[\]]/g, '') === tbl; };
+          const sib = par ? xAll(par, 'RelOp').find(x => x !== r && /(Seek|Scan)$/.test(x.attrs.PhysicalOp || '') && !/Lookup/.test(x.attrs.PhysicalOp || '') && sameT(x)) : null;
+          const sObj = sib ? xAll(sib, 'Object')[0] : null;
+          const sIdx = sObj && sObj.attrs.Index ? sObj.attrs.Index.replace(/[\[\]]/g, '') : '';
+          const sKeys = sib ? [...new Set(xAll(xAll(sib, 'SeekPredicates')[0] || { children: [] }, 'ColumnReference').map(c => c.attrs.Column).filter(c => c && !/^@/.test(c)))] : [];
+          const sch = obj ? (obj.attrs.Schema || '[dbo]').replace(/[\[\]]/g, '') : 'dbo';
+          const keySql = sKeys.length ? sKeys.map(c => `[${c}]`).join(', ') : '/* columnas clave actuales del índice */';
+          const proposal = { text: sIdx && !/^PK_|^CL/i.test(sIdx)
+              ? `Agregar las columnas leídas por el ${op} como INCLUDE en el índice ${sIdx} para eliminar las ${fmtN(execs)} búsquedas (validar con el DBA el tamaño y el costo de escritura). Alternativa: no seleccionar esas columnas si no se usan.`
+              : `Crear un índice que cubra el filtro y las columnas leídas (validar con el DBA). Alternativa: no seleccionar esas columnas si no se usan.`,
+            sql: sIdx && !/^PK_|^CL/i.test(sIdx)
+              ? `CREATE NONCLUSTERED INDEX [${sIdx}]\nON [${sch}].[${tbl}] (${keySql})\nINCLUDE (${cols.map(c => `[${c}]`).join(', ')})\nWITH (DROP_EXISTING = ON);`
+              : `CREATE NONCLUSTERED INDEX ${idxName(tbl, sKeys.length ? sKeys : ['Filtro'])}\nON [${sch}].[${tbl}] (${keySql})\nINCLUDE (${cols.map(c => `[${c}]`).join(', ')});` };
+          add(`P07|${n}|${node}`, 'P07', 'Media', 'Plan · Índices', `${op} en ${tbl}`, `${where}: ${fmtN(execs)} búsquedas adicionales para obtener ${cols.slice(0, 6).join(', ') || 'columnas no incluidas en el índice'}.`,
+            'El índice usado no cubre las columnas que se leen: por cada fila se hace una búsqueda adicional en la tabla.', [...L, ...colLines(cols.slice(0, 3), at)], 'Plan – Key Lookup', false, { stmt: n, proposal });
+        }
+      }
+      // ---- Table Scan (tabla sin índice clustered) y lectura residual elevada ----
+      const objR = xAll(r, 'Object')[0];
+      const tblR = objR ? (objR.attrs.Table || '').replace(/[\[\]]/g, '').replace(/_{3,}[0-9A-F]*$/i, '') : '';
+      const isTempR = /^[#@]/.test(tblR) || /tempdb/i.test(objR ? objR.attrs.Database || '' : '');
+      const schR = objR ? (objR.attrs.Schema || '[dbo]').replace(/[\[\]]/g, '') : 'dbo';
+      const readR = act && act.read != null ? act.read : xNum(ra.EstimatedRowsRead);
+      const rowsR = act ? act.rows : est;
+      const predR = xAll(r, 'Predicate')[0];
+      const pstrR = predR ? ((xAll(predR, 'ScalarOperator')[0] || { attrs: {} }).attrs.ScalarString || '') : '';
+      let pcolsR = predR ? [...new Set(xAll(predR, 'ColumnReference').filter(c => (c.attrs.Table || '').replace(/[\[\]]/g, '').replace(/_{3,}[0-9A-F]*$/i, '') === tblR).map(c => c.attrs.Column))] : [];
+      if (!pcolsR.length && pstrR && tblR) pcolsR = [...new Set(allMatches(new RegExp('\\[' + escRe(tblR) + '\\]\\.\\[(\\w+)\\]', 'gi'), pstrR).map(m => m[1]))];
+      const fnR = /\b(CONVERT_IMPLICIT|CONVERT|CAST|isnull|substring|left|right|datepart|year|month|day|upper|lower|ltrim|rtrim|dateadd|datediff)\s*\(/i.exec(pstrR);
+      const shortR = pstrR.replace(/\[[^\]]*\]\.\[[^\]]*\]\.\[([^\]]*)\]\.\[([^\]]*)\]( as \[[^\]]*\]\.\[[^\]]*\])?/g, '$1.$2').slice(0, 300);
+      const predProposal = (what) => fnR
+        ? { text: `El filtro aplica ${fnR[1].toUpperCase()} sobre la columna, por eso se ${what}. Reescribirlo para que la columna quede "limpia" (aplicar la función al valor, no a la columna)${/CONVERT_IMPLICIT/i.test(fnR[1]) ? '; ver la conversión implícita de esta sentencia' : ''}.`, sql: `-- Predicado actual del plan:\n-- ${shortR}` }
+        : { text: `El filtro no tiene un índice que lo soporte, por eso se ${what}. Proponer al DBA un índice con las columnas del filtro${pcolsR.length ? '' : ' (no visibles en el plan)'}.`,
+            sql: `${shortR ? `-- Predicado actual del plan:\n-- ${shortR}\n` : ''}${pcolsR.length ? `CREATE NONCLUSTERED INDEX ${idxName(tblR, pcolsR)}\nON [${schR}].[${tblR}] (${pcolsR.map(c => c.startsWith('[') ? c : `[${c}]`).join(', ')});` : ''}` };
+      const residualHigh = readR != null && rowsR != null && readR >= 10000 && readR >= Math.max(rowsR, 1) * 10;
+      if (op === 'Table Scan' && tblR && !isTempR) {
+        const card = xNum(ra.TableCardinality) || readR || 0;
+        if (card >= 1000) {
+          const colsSql = pcolsR.length ? pcolsR.map(c => c.startsWith('[') ? c : `[${c}]`).join(', ') : '/* columna clave o de búsqueda */';
+          const proposal = {
+            text: `La tabla ${schR}.${tblR} no tiene índice clustered (es un heap) y se recorre completa en cada ejecución. ` +
+              (fnR ? `Además el filtro aplica ${fnR[1].toUpperCase()} sobre la columna: corregirlo para que pueda usar un índice. ` : '') +
+              `Proponer al DBA un índice clustered${pcolsR.length ? ' sobre la columna del filtro' : ''} (o sobre la clave primaria si ya existe una) para que el motor haga un Seek.`,
+            sql: `${shortR ? `-- Predicado actual del plan:\n-- ${shortR}\n` : ''}-- Validar con el DBA la columna clave y el impacto en escrituras\nCREATE CLUSTERED INDEX CIX_${tblR}\nON [${schR}].[${tblR}] (${colsSql});` };
+          add(`P15|${n}|${node}`, 'P15', card >= 100000 ? 'Alta' : 'Media', 'Plan · Table Scan', `Table Scan en ${schR}.${tblR}`,
+            `${where}: Table Scan (nodo ${node}) sobre una tabla sin índice clustered de ${fmtN(card)} filas${readR != null ? `; leyó ${fmtN(readR)} y devolvió ${fmtN(rowsR)}` : ''}${act && act.execs > 1 ? ` en ${fmtN(act.execs)} ejecuciones` : ''}.`,
+            'Un Table Scan lee todas las páginas de la tabla en cada ejecución y no puede aprovechar índices de búsqueda.', L, 'Plan – Table Scan', false, { stmt: n, proposal, node: Number(node) });
+        }
+      } else if (residualHigh && tblR && !isTempR && /(Scan|Seek)$/.test(op) && !/Constant/.test(op)) {
+        const pct = rowsR / Math.max(readR, 1) * 100;
+        add(`P08|${n}|${node}`, 'P08', readR >= 1000000 || pct < 1 ? 'Alta' : 'Media', 'Plan · Lectura residual', `Lectura residual elevada en ${tblR}`,
+          `${where}: ${op} (nodo ${node}) leyó ${fmtN(readR)} filas y solo ${fmtN(rowsR)} cumplieron el filtro (${pct < 0.1 ? '<0.1' : pct.toFixed(1)}% útil; ${fmtN(readR - rowsR)} filas leídas de más)${act && act.read == null ? ' (estimado)' : ''}.`,
+          'El índice usado no filtra por las columnas del predicado: se leen muchas filas y se descartan después (predicado residual).', L, 'Plan – ActualRowsRead vs ActualRows', false,
+          { stmt: n, proposal: predProposal(/Seek$/.test(op) ? 'leen filas de más dentro del rango del Seek' : 'recorre el índice completo'), node: Number(node) });
+      }
+      // Desvío de estimación
+      if (act && est != null) {
+        const estT = est * Math.max(1, act.execs);
+        const ratio = act.rows > estT ? act.rows / Math.max(estT, 1) : estT / Math.max(act.rows, 1);
+        if (ratio >= 10 && Math.max(act.rows, estT) >= 1000) deviations.push({ op, node: Number(node), estT, rows: act.rows, ratio, tables: planTables(r), tvar: xAll(r, 'Object').some(o => /^\[?@/.test(o.attrs.Table || '')), temps: [...new Set(xAll(r, 'Object').map(o => (o.attrs.Table || '').replace(/[\[\]]/g, '').replace(/_{3,}[0-9A-F]*$/i, '')).filter(t => /^#/.test(t)))] });
+      }
+    }
+    // Un solo hallazgo por sentencia: el operador más profundo donde nace el desvío
+    const maxR = deviations.reduce((m, d) => Math.max(m, d.ratio), 0);
+    deviations.filter(d => d.ratio >= maxR * 0.5).sort((x, y) => y.node - x.node).slice(0, 1).forEach(d => {
+      add(`P09|${n}|${d.node}`, 'P09', 'Media', 'Plan · Estimación', 'Estimación de filas muy distinta a la real',
+        `${where}: ${d.op} (nodo ${d.node}) estimó ${fmtN(d.estT)} filas y procesó ${fmtN(d.rows)} (${Math.round(d.ratio)}x).`,
+        'Es el operador más profundo donde nace el desvío; los superiores lo heredan. Una mala estimación provoca memoria insuficiente (spills) o excesiva y malos tipos de JOIN.', L, 'Plan real – EstimateRows vs ActualRows', false,
+        { stmt: n, proposal: d.tvar
+          ? { text: 'El desvío viene de una variable tabla (sin estadísticas). Cambiarla por una #temporal declarada con CREATE TABLE.' }
+          : d.tables.length || stTables.length
+            ? { text: 'Actualizar estadísticas de las tablas involucradas y revisar conversiones implícitas o funciones sobre columnas en los filtros de esta sentencia (son la causa más común).', sql: statsScript(d.tables.length ? d.tables : stTables) }
+            : { text: `El desvío está sobre una #temporal${d.temps.length ? ' (' + d.temps.join(', ') + ')' : ''}: revisar que se cargue solo con las filas necesarias y actualizar sus estadísticas después de cargarla (o crear un índice sobre la columna de unión).`,
+                sql: d.temps.map(t => `UPDATE STATISTICS ${t};`).join('\n') } });
+    });
+
+    // --- Advertencias a nivel de sentencia ---
+    const qws: any[] = qp.children.filter(x => x.name === 'Warnings');
+    const qw = qws[0] || null;
+    const convs: { issue: string; expr: string }[] = [];
+    for (const w of qws) for (const c of w.children.filter(x => x.name === 'PlanAffectingConvert')) convs.push({ issue: c.attrs.ConvertIssue || '', expr: c.attrs.Expression || '' });
+    // Solo las conversiones que el plan marca como alerta (PlanAffectingConvert). Las CONVERT_IMPLICIT que
+    // aparecen en expresiones sin advertencia no afectan el plan y no se reportan.
+    const seenConv = new Set();
+    for (const c of convs) {
+      for (const m of allMatches(CONV_RE, c.expr)) {
+        const ref = parseColRef(m[2]);
+        if (ref.isVar || !ref.column || ref.isTableVar) continue;
+        const conv = { type: m[1].toLowerCase(), table: ref.table, column: ref.column, alias: ref.alias, isTemp: ref.isTemp, issue: c.issue };
+        const k = `${conv.table}.${conv.column}|${conv.type}`.toLowerCase();
+        if (seenConv.has(k)) continue;
+        seenConv.add(k);
+        st.converts++;
+        const seek = /seek/i.test(c.issue);
+        const unicode = /^n(var)?char/.test(conv.type);
+        const numeric = /^(int|bigint|smallint|tinyint|decimal|numeric|money|smallmoney|float|real|bit)/.test(conv.type);
+        const ed = src ? convertEdits(src, masked, conv) : { edits: [], notes: [] };
+        const key = `P02|${k}`;
+        if (ed.edits.length) res.fixes.converts.push(Object.assign({ key }, conv));
+        if (unicode) res.fixes.convertsAll.push(Object.assign({ key, stmt: n }, conv));
+        const sa = unicode ? applyConvert(text, conv, st.params) : { src: text, count: 0, notes: [] };
+        const snip = sa.count ? changedSnippet(text, sa.src) : '';
+        // Otro operando de la comparación según el plan
+        let other: any = null;
+        for (const so of xAll(qp, 'ScalarOperator')) {
+          const ss = so.attrs.ScalarString || '';
+          if (!/CONVERT_IMPLICIT/i.test(ss) || !new RegExp('\\[' + escRe(conv.column) + '\\]', 'i').test(ss)) continue;
+          const parts = ss.split(/\s*(?:=|<>|>=|<=|>|<)\s*/);
+          const side = parts.find(x => !/CONVERT_IMPLICIT/i.test(x));
+          if (!side) continue;
+          const tm = /#(\w+?)_{3,}[0-9A-F]*\]?\.\[(\w+)\]/i.exec(side) || /\[#(\w+)\]\.\[(\w+)\]/i.exec(side);
+          if (tm) { other = { kind: 'temp', table: '#' + tm[1], col: tm[2] }; break; }
+          const vm = /\[?(@\w+)\]?/.exec(side);
+          if (vm) { other = { kind: st.params.some(p => p.name.toLowerCase() === vm[1].toLowerCase()) ? 'param' : 'var', name: vm[1] }; break; }
+          if (/^N'/i.test(side.trim())) { other = { kind: 'lit', text: side.trim() }; break; }
+        }
+        const colRef = `${conv.alias ? conv.alias + '.' : ''}${conv.column}`;
+        const vlen = `<largo de ${conv.table}.${conv.column}>`;
+        const generic = !unicode ? null
+          : other && other.kind === 'temp' ? { text: `La comparación es contra ${other.table}.${other.col} (NVARCHAR). Definir esa columna de la temporal con el mismo tipo que ${conv.table}.${conv.column} (VARCHAR).`,
+              sql: `-- En la definición de la temporal:\nCREATE TABLE ${other.table}\n(\n    …\n    ${other.col} VARCHAR(${vlen}) COLLATE SQL_Latin1_General_CP1_CI_AS,\n    …\n);` }
+          : other && other.kind === 'var' ? { text: `La comparación es contra la variable ${other.name} (NVARCHAR). Declararla como VARCHAR del largo de la columna.`, sql: `DECLARE ${other.name} VARCHAR(${vlen});` }
+          : other && other.kind === 'lit' ? { text: 'Quitar el prefijo N del literal.', sql: `-- … WHERE ${colRef} = ${other.text.slice(1)}` }
+          : { text: `Igualar el tipo del otro operando al de ${conv.table}.${conv.column} (VARCHAR/CHAR): variable local VARCHAR del mismo largo, literal sin N o columna de la #temporal como VARCHAR.`,
+              sql: `-- Ejemplo (sin cambiar la firma del PA):\nDECLARE @valorLocal VARCHAR(${vlen}) = @parametro;\n-- … WHERE ${colRef} = @valorLocal` };
+        const proposal = snip
+          ? { text: `Igualar el tipo del otro operando al de la columna ${conv.table}.${conv.column} (${[...new Set(sa.notes)].join('; ')}). Validar el tipo y largo exacto con los scripts de Metadatos.`, sql: snip }
+          : generic ? generic
+          : numeric ? { text: `Comparar ${conv.column} con un texto o una variable del mismo tipo que la columna, previa validación del formato (no es equivalente: '01' ≠ '1').`, sql: `-- … WHERE ${conv.alias ? conv.alias + '.' : ''}${conv.column} = '<valor como texto>'` }
+          : { text: 'Comparar con un valor del mismo tipo que la columna.' };
+        const lines = [...L];
+        if (src) for (const cc of columnComparisons(masked, conv)) lines.push(lineOf(src, cc.idx));
+        const det = `${where}: CONVERT_IMPLICIT(${conv.type}, ${conv.table}.${conv.column}) — la columna se convierte a ${conv.type}` +
+          (seek ? ', lo que impide el Index Seek y distorsiona la estimación de filas.' : ', lo que distorsiona la estimación de filas (memoria y tipo de JOIN).') +
+          (ed.notes.length ? ` Se aplicará: ${[...new Set(ed.notes)].join('; ')}.` : '');
+        const rec = unicode
+          ? 'El otro lado de la comparación es NVARCHAR/NCHAR o literal N\'…\' y la columna es VARCHAR/CHAR. Igualar el tipo al de la columna: variable local VARCHAR del mismo largo (sin cambiar la firma del PA), quitar la N del literal o definir la columna de la temporal como VARCHAR.' + (ed.edits.length ? '' : ' No se encontró en el código una comparación que se pueda corregir automáticamente: revisar el JOIN/WHERE indicado.')
+          : numeric ? 'La columna de texto se compara con un valor numérico: comparar con un texto (\'…\') o una variable del mismo tipo de la columna. No se aplica automáticamente porque no es equivalente (\'01\' ≠ \'1\' pero ambos = 1).'
+          : 'Comparar con un valor del mismo tipo que la columna (confirmar tipos con los scripts de Metadatos).';
+        add(key, seek ? 'P02' : 'P03', seek ? 'Alta' : 'Media', 'Plan · Conversión implícita (alerta)', `Conversión implícita en ${conv.table}.${conv.column}`,
+          det.replace(' — la columna', ` — alerta "${c.issue}": la columna`), rec, lines,
+          'Plan – advertencia PlanAffectingConvert (' + c.issue + ')', ed.edits.length > 0 || !!snip, { stmt: n, proposal });
+      }
+    }
+
+    // --- Memoria ---
+    const mgw = qws.flatMap(w => w.children).find(x => x.name === 'MemoryGrantWarning') || null;
+    const granted = st.grantedKB, used = st.usedKB;
+    // Elevada: concesión >= 50 MB y uso < 10 % (o la alerta Excessive Grant de SQL Server con concesión >= 50 MB)
+    const HIGH_GRANT_KB = 51200;
+    const excessive = granted != null && granted >= HIGH_GRANT_KB &&
+      ((mgw && /Excessive/i.test(mgw.attrs.GrantWarningKind || '')) || (used != null && used / Math.max(granted, 1) < 0.1));
+    if (excessive) {
+      st.warnings++;
+      res.fixes.excessiveGrant = true;
+      const causes: string[] = [];
+      const maxEd = src ? maxColumnEdits(masked) : [];
+      if (maxEd.length) causes.push(`${maxEd.length} columna(s) VARCHAR(MAX) en temporales/variables tabla`);
+      if (src && /\bSELECT\s+(?:\w+\.)?\*/i.test(masked)) causes.push('SELECT * (más columnas de las necesarias)');
+      if (deviations.some(d => d.estT > d.rows)) causes.push('filas estimadas muy por encima de las reales');
+      const pct = granted ? Math.round((used || 0) * 1000 / granted) / 10 : 0;
+      // Operadores que piden memoria (Sort / Hash) y su tamaño estimado
+      const cons = relops.filter(r => /Sort|Hash/.test(r.attrs.PhysicalOp || '')).map(r => {
+        const rows = xNum(r.attrs.EstimateRows) || 0, size = xNum(r.attrs.AvgRowSize);
+        const act = r.children.find(c => c.name === 'RunTimeInformation');
+        const real = act ? act.children.filter(c => c.name === 'RunTimeCountersPerThread').reduce((a2, t) => a2 + (xNum(t.attrs.ActualRows) || 0), 0) : null;
+        const cols = [...new Set(xAll(xKid(r, 'OutputList') || { children: [] }, 'ColumnReference').map(c => c.attrs.Column).filter(Boolean))];
+        return { op: r.attrs.PhysicalOp, node: r.attrs.NodeId, rows, real, size, mb: size ? rows * size / 1048576 : null, cols };
+      });
+      const consTxt = cons.map(c => `-- ${c.op} (nodo ${c.node}): ${fmtN(c.rows)} filas estimadas${c.real != null ? ` / ${fmtN(c.real)} reales` : ''}${c.size ? ` × ${fmtN(c.size)} bytes ≈ ${(c.mb || 0).toFixed(1)} MB` : ''}${c.cols.length ? `\n--   columnas: ${c.cols.slice(0, 12).join(', ')}` : ''}`).join('\n');
+      const p4: string[] = [];
+      if (/\bSELECT\s+(?:\w+\.)?\*/i.test(mask(text).masked)) p4.push('reemplazar SELECT * por las columnas que realmente se usan');
+      if (cons.some(c => c.size && c.size >= 1000)) p4.push('quitar del Sort/Hash las columnas anchas (VARCHAR grandes o MAX) que no se necesitan para ordenar o unir; traerlas después con un JOIN por la clave');
+      if (deviations.some(d => d.estT > d.rows)) p4.push('corregir la sobreestimación de filas (estadísticas, variables tabla → #temporal)');
+      p4.push('filtrar antes de ordenar/agrupar');
+      const proposal4 = { text: `Para reducir la memoria reservada: ${p4.join('; ')}.${maxEd.length ? ' Las columnas VARCHAR(MAX) de las temporales se pueden reducir con la opción del plan (validar longitud).' : ''}`,
+        sql: [consTxt, deviations.some(d => d.estT > d.rows) ? statsScript(stTables) : ''].filter(Boolean).join('\n') };
+      add(`P04|${n}`, 'P04', granted >= 102400 ? 'Alta' : 'Media', 'Plan · Memoria', 'Sobreestimación de memoria elevada',
+        `${where}: concedidos ${fmtKB(granted)}, usados ${fmtKB(used)} (${pct}%); ${fmtKB(granted - (used || 0))} reservados sin usar.${causes.length ? ' Posibles causas: ' + causes.join('; ') + '.' : ''}`,
+        'Reservar memoria de más bloquea a otras consultas (RESOURCE_SEMAPHORE). Reducir el ancho de las filas que pasan por Sort/Hash (columnas necesarias, sin VARCHAR(MAX) en temporales; la opción del plan lo cambia a VARCHAR(2000) para validar), filtrar antes de ordenar/agrupar y corregir estimaciones. En SQL 2019 el Memory Grant Feedback ajusta ejecuciones siguientes, pero la primera sigue reservando de más.',
+        L, 'Plan real – MemoryGrantInfo / Excessive Grant', maxEd.length > 0, { stmt: n, proposal: proposal4 });
+    }
+    if (mgw && /Used More Than Granted/i.test(mgw.attrs.GrantWarningKind || '')) {
+      add(`P05|${n}`, 'P05', 'Alta', 'Plan · Memoria', 'Memoria insuficiente (usó más de lo concedido)',
+        `${where}: solicitados ${fmtKB(xNum(mgw.attrs.RequestedMemory))}, concedidos ${fmtKB(xNum(mgw.attrs.GrantedMemory))}, usados ${fmtKB(xNum(mgw.attrs.MaxUsedMemory))}.`,
+        'La estimación de filas fue baja: corregir estadísticas, conversiones y predicados no SARGables para que el motor reserve la memoria adecuada.', L, 'Plan – MemoryGrantWarning', false,
+        { stmt: n, proposal: { text: 'Actualizar estadísticas de las tablas de la sentencia y revisar las conversiones/funciones sobre columnas que distorsionan la estimación.', sql: statsScript(stTables) } });
+    }
+    if (st.waitMs && st.waitMs > 0) add(`P13|${n}`, 'P13', 'Info', 'Plan · Memoria', 'Espera por concesión de memoria', `${where}: esperó ${fmtN(st.waitMs)} ms para obtener memoria.`,
+      'Indica presión de memoria en el servidor; reducir la memoria solicitada (ver sobreestimación) ayuda a todas las consultas.', L, 'Plan – GrantWaitTime', false,
+      { stmt: n, proposal: { text: 'Aplicar las mejoras de sobreestimación de memoria de esta sentencia; si persiste, reportar al DBA la espera RESOURCE_SEMAPHORE con la hora de ejecución.' } });
+    const big = relops.filter(r => /Scan|Seek/.test(r.attrs.PhysicalOp || '')).map(r => ({ r, card: xNum(r.attrs.TableCardinality) || xNum(r.attrs.EstimatedRowsRead) || 0, o: xAll(r, 'Object')[0] }))
+      .filter(x => x.o && !/^\[?[#@]/.test(x.o.attrs.Table || '') && !/tempdb/i.test(x.o.attrs.Database || '')).sort((a2, b2) => b2.card - a2.card)[0];
+    const bigT = big ? `${(big.o.attrs.Schema || '[dbo]').replace(/[\[\]]/g, '')}.${(big.o.attrs.Table || '').replace(/[\[\]]/g, '')}` : '<tabla de mayor volumen>';
+    const bigA = big && big.o.attrs.Alias ? big.o.attrs.Alias.replace(/[\[\]]/g, '') : 'T';
+    if (st.timeout) add(`P11|${n}`, 'P11', 'Media', 'Plan · Compilación', 'El optimizador abandonó por tiempo (TimeOut)',
+      `${where}: el plan elegido puede no ser el óptimo porque la consulta es demasiado compleja.`,
+      'Dividir la consulta: obtener primero el subconjunto de la tabla de mayor volumen en una #temporal y luego hacer los JOIN sobre ella (Manual BP – Consulta con tablas de gran volumen).', L, 'Plan – StatementOptmEarlyAbortReason', false,
+      { stmt: n, proposal: { text: `Separar en dos pasos empezando por ${bigT}${big ? ` (${fmtN(big.card)} filas)` : ''}, la tabla de mayor volumen del plan.`,
+        sql: `-- 1) Subconjunto de la tabla de mayor volumen, solo con las columnas y filtros necesarios\nCREATE TABLE #Base (/* columnas necesarias con su tipo exacto + COLLATE en texto */);\nINSERT INTO #Base (/* columnas */)\nSELECT /* columnas */\nFROM ${bigT} AS ${bigA} WITH (NOLOCK)\nWHERE /* filtros más selectivos de la consulta original */;\n\n-- 2) Resto de JOIN sobre #Base\nSELECT /* … */\nFROM #Base AS ${bigA}\nINNER JOIN /* demás tablas WITH (NOLOCK) */ ON /* … */;` } });
+
+    // --- Índices faltantes ---
+    for (const g2 of xAll(qp, 'MissingIndexGroup')) {
+      const impact = xNum(g2.attrs.Impact);
+      for (const mi of xAll(g2, 'MissingIndex')) {
+        const t = (mi.attrs.Table || '').replace(/[\[\]]/g, ''), sch = (mi.attrs.Schema || '[dbo]').replace(/[\[\]]/g, ''), db = (mi.attrs.Database || '').replace(/[\[\]]/g, '');
+        const grp = u => xAll(mi, 'ColumnGroup').filter(c => c.attrs.Usage === u).flatMap(c => xAll(c, 'Column').map(x => x.attrs.Name));
+        const keyCols = [...grp('EQUALITY'), ...grp('INEQUALITY')], inc = grp('INCLUDE');
+        if (!keyCols.length) continue;
+        const nm = `IX_${t}_${keyCols.map(c => c.replace(/[\[\]]/g, '')).slice(0, 3).join('_')}`;
+        const script = `-- Impacto estimado: ${impact != null ? impact.toFixed(1) : '?'}%${db ? ' · Base: ' + db : ''} · Validar con DBA\nCREATE NONCLUSTERED INDEX ${nm}\nON [${sch}].[${t}] (${keyCols.join(', ')})${inc.length ? `\nINCLUDE (${inc.join(', ')})` : ''};`;
+        if (res.missingIndexes.some(x => x.script === script)) continue;
+        res.missingIndexes.push({ table: t, impact, script, stmt: n });
+        add(`P06|${n}|${t}|${keyCols.join(',')}`, 'P06', impact != null && impact >= 50 ? 'Media' : 'Baja', 'Plan · Índices', `Índice sugerido por el plan en ${t}`,
+          `${where}: impacto estimado ${impact != null ? impact.toFixed(1) : '?'}%. Claves: ${keyCols.join(', ')}${inc.length ? '; INCLUDE: ' + inc.join(', ') : ''}.`,
+          'No se crea automáticamente: validar con el DBA (índices existentes que se puedan ampliar, duplicados, costo de escritura).', [...L, ...colLines(keyCols.map(c => c.replace(/[\[\]]/g, '')).slice(0, 2), at)], 'Plan – MissingIndex', false,
+          { stmt: n, script, proposal: { text: 'Índice sugerido por el optimizador. Antes de crearlo revisar si ya existe uno con las mismas claves que se pueda ampliar con INCLUDE.', sql: script } });
+      }
+    }
+  });
+  if (!stmts.length) { res.ok = false; res.error = 'El plan no contiene sentencias con QueryPlan.'; }
+  if (res.ok && !res.isActual) add('P00', 'P00', 'Info', 'Plan', 'Plan estimado (sin datos reales)',
+    'El archivo es un plan estimado: no incluye filas reales, memoria usada ni spills.',
+    'Para detectar spills y sobreestimación de memoria, guarda el plan real (en SSMS: "Incluir plan de ejecución real" Ctrl+M, ejecutar y luego "Guardar plan de ejecución como…").', [], 'Plan', false,
+    { proposal: { text: 'Volver a capturar el plan real con SET STATISTICS IO, TIME ON para comparar lecturas lógicas antes y después.' } });
+  // Revisión principal (en este orden): spills, conversiones con alerta, Table Scan, memoria elevada, lectura residual.
+  const FOCUS: Record<string, number> = { P01: 0, P02: 1, P03: 1, P15: 2, P04: 3, P08: 4 };
+  const order: Record<string, number> = { Alta: 0, Media: 1, Baja: 2, Info: 3 };
+  F.forEach(f => { f.main = f.id in FOCUS; });
+  F.sort((x, y) => (x.main === y.main ? 0 : x.main ? -1 : 1) || (x.main ? FOCUS[x.id] - FOCUS[y.id] : 0) || order[x.sev] - order[y.sev] || x.id.localeCompare(y.id));
+  res.focus = {
+    spills: F.filter(f => f.id === 'P01').length,
+    converts: F.filter(f => f.id === 'P02' || f.id === 'P03').length,
+    tableScans: F.filter(f => f.id === 'P15').length,
+    memory: F.filter(f => f.id === 'P04').length,
+    residual: F.filter(f => f.id === 'P08').length
+  };
+  return res;
+}
+
+// Aplica las correcciones derivadas del plan (antes que las de código, para ubicar las sentencias)
+function applyPlanFixes(src, plan, opts) {
+  const applied: AppliedChange[] = [], fixed: string[] = [];
+  if (!plan || !plan.ok) return { src, applied, fixed };
+  if (opts.planConvert) {
+    let n = 0; const notes: any[] = [];
+    for (const c of plan.fixes.converts) {
+      const r = applyConvert(src, c);
+      if (r.count) { src = r.src; n++; fixed.push(c.key); notes.push(...r.notes); }
+    }
+    if (n) applied.push({ key: 'planConvert', label: `Plan: conversiones implícitas corregidas (${n})`, count: n, motivo: 'Plan – CONVERT_IMPLICIT (impide Index Seek)', seguro: `Se iguala el tipo del otro operando al de la columna (${[...new Set(notes)].join('; ')}). Equivalente si los valores no contienen caracteres Unicode fuera de Latin-1; validar tipo exacto con Metadatos.` });
+  }
+  if (opts.planSort) {
+    const { masked } = mask(src);
+    const edits: any[] = [];
+    for (const s of plan.fixes.sorts) {
+      const at = locateInSource(src, (plan.statements.find(x => x.n === s.stmt) || {}).fullText);
+      if (at < 0) continue;
+      const e = insertOrderByEdit(src, masked, at, s.cols);
+      if (e && !edits.some(x => x.start === e.start)) { edits.push(e); fixed.push(s.key); }
+    }
+    if (edits.length) {
+      src = applyEdits(src, edits);
+      applied.push({ key: 'planSort', label: `Plan: ORDER BY quitado en INSERT a temporal (${edits.length})`, count: edits.length, motivo: 'Plan – Sort con spill / costo de ordenamiento', seguro: 'El orden de inserción en una tabla no está garantizado y la temporal no tiene IDENTITY: el contenido es el mismo.' });
+    }
+  }
+  if (opts.planMaxGrant && plan.fixes.excessiveGrant) {
+    const { masked } = mask(src);
+    const edits = maxColumnEdits(masked);
+    if (edits.length) {
+      src = applyEdits(src, edits);
+      applied.push({ key: 'planMaxGrant', label: `Plan: VARCHAR(MAX) → VARCHAR(2000) en temporales (${edits.length})`, count: edits.length, motivo: 'Plan – Sobreestimación de memoria', seguro: 'Reduce la memoria reservada. Validar que ningún valor supere 2000 caracteres (marcado con TODO).' });
+    }
+  }
+  return { src, applied, fixed };
+}
+
+/**
+ * Mejora cada sentencia del plan SIN necesidad del procedimiento: aplica las correcciones del plan
+ * (conversiones, Sort) y las de código seleccionadas sobre el texto de la sentencia.
+ */
+export function improvePlan(plan: PlanAnalysis | null, opts: OptimizeOptions): ImprovedPlan {
+  if (!plan || !plan.ok) return { statements: [], fixed: [] };
+  opts = opts || {};
+  const code = Object.assign({}, opts, { closeTran: false, nocount: false, reviewNotes: false, removeComments: false, planConvert: false, planSort: false, planMaxGrant: false });
+  const allFixed: string[] = [];
+  const statements = plan.statements.map(st => {
+    let s = st.fullText; const applied: string[] = [], fixed: string[] = [];
+    if (opts.planSort) for (const so of plan.fixes.sorts.filter(x => x.stmt === st.n)) {
+      const e = insertOrderByEdit(s, mask(s).masked, 0, so.cols);
+      if (e) { s = applyEdits(s, [e]); applied.push('ORDER BY quitado (Sort con spill)'); fixed.push(so.key); }
+    }
+    if (opts.planConvert) for (const c of plan.fixes.convertsAll.filter(c => c.stmt === st.n)) {
+      const r = applyConvert(s, c, st.params);
+      if (r.count) { s = r.src; applied.push(`Conversión implícita en ${c.table}.${c.column}`); fixed.push(c.key); }
+    }
+    const o = optimize(s, code, null);
+    s = o.src; applied.push(...o.applied.map(a => a.label));
+    allFixed.push(...fixed);
+    return { n: st.n, type: st.type, line: st.line, before: st.fullText, after: s, applied, fixed };
+  });
+  return { statements, fixed: allFixed };
+}
+
+/** Puntaje 0-100 del plan (independiente del código). */
+export function planScore(findings: Finding[]): number {
+  const w: Record<string, number> = { Alta: 8, Media: 4, Baja: 1, Info: 0 };
+  return Math.max(0, 100 - (findings || []).reduce((a, f) => a + (w[f.sev] || 0) + (f.id === 'P01' ? 7 : 0), 0));
+}
+
+/** Une hallazgos de código y de plan, quitando los del plan ya corregidos. */
+export function combine(analysis: AnalysisResult, plan?: PlanAnalysis | null, fixed?: string[]): AnalysisResult {
+  const fx = new Set<string>(fixed || []);
+  const code: Finding[] = analysis.findings.map(f => Object.assign({ key: f.id, source: 'code' as const }, f));
+  const pf = plan && plan.findings ? plan.findings.filter(f => !fx.has(f.key || '')) : [];
+  const order: Record<string, number> = { Alta: 0, Media: 1, Baja: 2, Info: 3 };
+  const findings = [...code, ...pf].sort((a, b) => order[a.sev] - order[b.sev] || a.id.localeCompare(b.id));
+  const w: Record<string, number> = { Alta: 6, Media: 3, Baja: 1, Info: 0 };
+  const score = Math.max(0, 100 - findings.reduce((s, f) => s + w[f.sev], 0));
+  return Object.assign({}, analysis, { findings, score });
+}
+
+/** Sección del reporte para el DBA. */
+export function planReport(plan?: PlanAnalysis | null, fixed?: string[] | null, improved?: ImprovedPlan | null): string {
+  if (!plan || !plan.ok) return '';
+  const fx = new Set<string>(fixed || []);
+  let r = `\n## ${improved ? '' : '5. '}Plan de ejecución (${plan.isActual ? 'real' : 'estimado'})\n`;
+  r += `| # | Línea | Tipo | Costo | Memoria concedida / usada | Spills | Conversiones | Tiempo |\n|---|---|---|---|---|---|---|---|\n`;
+  for (const s of plan.statements)
+    r += `| ${s.n} | ${s.line || '—'} | ${s.type} | ${s.cost != null ? s.cost.toFixed(3) : '—'} | ${fmtKB(s.grantedKB)} / ${fmtKB(s.usedKB)} | ${s.spills} | ${s.converts} | ${s.elapsedMs != null ? fmtN(s.elapsedMs) + ' ms' : '—'} |\n`;
+  r += `\n### Hallazgos y mejoras propuestas\n`;
+  const order = ['Alta', 'Media', 'Baja', 'Info'];
+  for (const sev of order) for (const f of plan.findings.filter(x => x.sev === sev)) {
+    r += `- **${f.id} ${f.title}** (${f.sev}${fx.has(f.key || '') ? ', aplicado' : ''})\n  ${f.detail} ${f.rec}\n`;
+    if (f.proposal) {
+      r += `  **Mejora propuesta:** ${f.proposal.text}\n`;
+      if (f.proposal.sql) r += '```sql\n' + f.proposal.sql + '\n```\n';
+    }
+  }
+  if (improved && improved.statements.some(x => x.after !== x.before)) {
+    r += `\n### Sentencias mejoradas\n`;
+    for (const x of improved.statements.filter(y => y.after !== y.before))
+      r += `\n**Sentencia ${x.n} (${x.type})** — ${x.applied.join(' · ')}\n` + '```sql\n' + x.after + '\n```\n';
+  }
+  return r;
 }
