@@ -20,16 +20,17 @@
             "tsConfig": "tsconfig.app.json",
             "inlineStyleLanguage": "scss",
             "assets": [{ "glob": "**/*", "input": "public" }],
-            "styles": ["src/styles.scss"],
+            "styles": ["src/styles.scss", "src/pwa.scss"],
             "scripts": []
           },
           "configurations": {
             "production": {
               "budgets": [
-                { "type": "initial", "maximumWarning": "700kB", "maximumError": "1.2MB" },
+                { "type": "initial", "maximumWarning": "750kB", "maximumError": "1.3MB" },
                 { "type": "anyComponentStyle", "maximumWarning": "4kB", "maximumError": "8kB" }
               ],
-              "outputHashing": "all"
+              "outputHashing": "all",
+              "serviceWorker": "ngsw-config.json"
             },
             "development": { "optimization": false, "extractLicenses": false, "sourceMap": true }
           },
@@ -50,7 +51,7 @@
             "tsConfig": "tsconfig.spec.json",
             "inlineStyleLanguage": "scss",
             "assets": [{ "glob": "**/*", "input": "public" }],
-            "styles": ["src/styles.scss"],
+            "styles": ["src/styles.scss", "src/pwa.scss"],
             "scripts": []
           }
         }

@@ -1,13 +1,14 @@
 {
   "name": "sql-optimizer",
-  "version": "1.6.0",
-  "description": "Optimizador de procedimientos almacenados SQL Server 2019 con las buenas prácticas de la UPBD (skill pa-sqlserver-cajaica) y análisis de planes de ejecución",
+  "version": "1.7.0",
+  "description": "Optimizador de procedimientos almacenados SQL Server 2019 con las buenas prácticas de la UPBD (skill pa-sqlserver-cajaica) y análisis de planes de ejecución. Instalable como aplicación (PWA).",
   "private": true,
   "scripts": {
     "ng": "ng",
     "start": "ng serve --open",
     "build": "ng build",
     "build:prod": "ng build --configuration production",
+    "serve:pwa": "npx http-server dist/sql-optimizer/browser -p 8080 -c-1 -o",
     "watch": "ng build --watch --configuration development",
     "test": "ng test",
     "test:ci": "ng test --watch=false --browsers=ChromeHeadless"
@@ -18,6 +19,7 @@
     "@angular/core": "^18.2.0",
     "@angular/forms": "^18.2.0",
     "@angular/platform-browser": "^18.2.0",
+    "@angular/service-worker": "^18.2.0",
     "rxjs": "~7.8.0",
     "tslib": "^2.6.0",
     "zone.js": "~0.14.10"
