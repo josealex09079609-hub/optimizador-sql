@@ -1,6 +1,7 @@
 import { ChangeDetectionStrategy, Component, computed, inject } from '@angular/core';
 import { ProcPageComponent } from './features/proc/proc-page.component';
 import { PlanPageComponent } from './features/plan/plan-page.component';
+import { PwaBarComponent } from './shared/pwa-bar.component';
 import { OptimizerStore } from './core/services/optimizer.store';
 import { ThemeService } from './core/services/theme.service';
 import { ClipboardService } from './core/services/clipboard.service';
@@ -8,7 +9,7 @@ import { ClipboardService } from './core/services/clipboard.service';
 @Component({
   selector: 'app-root',
   standalone: true,
-  imports: [ProcPageComponent, PlanPageComponent],
+  imports: [ProcPageComponent, PlanPageComponent, PwaBarComponent],
   changeDetection: ChangeDetectionStrategy.OnPush,
   templateUrl: './app.component.html'
 })
