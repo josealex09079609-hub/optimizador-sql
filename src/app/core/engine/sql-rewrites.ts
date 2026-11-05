@@ -1,17 +1,22 @@
 /**
- * v1.8 · Reescrituras SARGables y detección de DML sobre tablas temporales.
+ * v1.8.1 · Reescrituras SARGables y detección de DML sobre tablas temporales.
  *
  * Regla de oro: solo se reescribe cuando el resultado es EXACTAMENTE el mismo. La función se quita de la columna
- * y se aplica al valor, para que el motor pueda usar Index Seek:
- *   - SUBSTRING(col, 1, n) / LEFT(col, n) = 'xxx'          → col LIKE 'xxx%'
- *   - SUBSTRING(col, 1, n) BETWEEN '…' AND '…' (dígitos)    → col >= '…' AND col < '…+1'
- *   - CONVERT(DATE, dCol) / CAST(dCol AS DATE) = X           → dCol >= X AND dCol < DATEADD(DAY, 1, X)
- *   - CONVERT(VARCHAR(8), dCol, 112) = 'yyyymmdd'            → dCol >= 'yyyymmdd' AND dCol < 'día siguiente'
- *   - YEAR(dCol) = 2026 | @nAnio | YEAR(GETDATE())           → rango con DATEADD(YEAR, …, 0)
- *   - YEAR(dCol) = Y AND MONTH(dCol) = M                     → rango con DATEADD(MONTH, …, 0)
- *   - DATEDIFF(DAY|MONTH|YEAR, dCol, X) op N                 → rango con DATEADD/DATEDIFF sobre X
- *   - DATEADD(DAY|HOUR|MINUTE|SECOND|WEEK, n, dCol) op X     → dCol op DATEADD(…, -n, X)
- * Las reescrituras de fechas solo se aplican a columnas con prefijo de fecha (dFecha…, nomenclatura del área).
+ * y se aplica al valor:
+ *   SUBSTRING / LEFT
+ *   - SUBSTRING(col, 1, n) / LEFT(col, n) = 'xxx'            → col LIKE 'xxx%'            (permite Index Seek)
+ *   - SUBSTRING(col, s, n) = 'xxx'  (s > 1)                   → col LIKE '___xxx%'         (sin función sobre la columna)
+ *   - SUBSTRING(col, s, n) IN ('a', 'b')                      → (col LIKE '…a%' OR col LIKE '…b%')
+ *   - SUBSTRING(col, s, n) = 305 (número de n dígitos)        → col LIKE '…305%'
+ *   - SUBSTRING(col, 1, n) BETWEEN / >= / > / <= / < '…'      → rango sobre la columna (literales numéricos)
+ *   - 'xxx' = SUBSTRING(col, …)  (literal a la izquierda)     → igual que arriba
+ *   FECHAS (solo columnas con prefijo d: dFecha, dVigencia…)
+ *   - CONVERT(DATE, dCol) / CAST(dCol AS DATE) op X          → rango con DATEADD(DAY, 1, X)
+ *   - CONVERT(VARCHAR(8), dCol, 112) = 'yyyymmdd'             → rango de un día
+ *   - YEAR(dCol) op Y   ·   YEAR(dCol) = Y AND MONTH(dCol) = M → rangos con DATEADD/DATEDIFF
+ *   - DATEDIFF(DAY|MONTH|YEAR, dCol, X) op N                  → rango con DATEADD/DATEDIFF sobre X
+ *   - DATEADD(DAY|HOUR|MINUTE|SECOND|WEEK, n, dCol) op X      → dCol op DATEADD(…, -n, X)
+ * No se reescribe cuando se compara con una variable o con otra columna (no es equivalente en todos los casos).
  * Este módulo no depende de Angular ni de sql-engine.ts.
  */
 
@@ -20,6 +25,7 @@ export interface SargResult { src: string; count: number; changes: SargChange[];
 interface Edit { start: number; end: number; text: string; rule: string; }
 interface Span { start: number; end: number; }
 interface ColRef { text: string; col: string; }
+interface Cmp { op: string; a: Span; b?: Span; end: number; }
 
 // ---------------------------------------------------------------- utilidades
 
@@ -73,7 +79,6 @@ function allMatches(re: RegExp, s: string): RegExpExecArray[] {
 const lineOf = (s: string, idx: number) => s.slice(0, idx).split('\n').length;
 const escRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
-/** Divide argumentos de primer nivel (devuelve posiciones absolutas). */
 function splitArgs(masked: string, open: number, close: number): Span[] {
   const res: Span[] = []; let depth = 0, st = open + 1;
   for (let i = open + 1; i < close; i++) {
@@ -101,7 +106,7 @@ const isDateCol = (c: ColRef) => /^d[A-Z]/.test(c.col);
 
 const STOP_KW = /^(AND|OR|WHERE|GROUP|ORDER|HAVING|UNION|EXCEPT|INTERSECT|INNER|CROSS|FULL|OUTER|JOIN|ON|THEN|WHEN|ELSE|END|BEGIN|SELECT|FROM|INSERT|UPDATE|DELETE|MERGE|SET|IF|WHILE|RETURN|OPTION|COLLATE|ESCAPE|DECLARE|EXEC|EXECUTE|PRINT|COMMIT|ROLLBACK|FOR)$/i;
 
-/** Lee el operando que sigue a un operador de comparación (hasta AND/OR/coma/paréntesis de cierre…). */
+/** Lee el operando que sigue a un operador (hasta AND/OR/coma/paréntesis de cierre…). */
 function readOperand(masked: string, pos: number): Span | null {
   let i = pos;
   while (i < masked.length && /\s/.test(masked[i])) i++;
@@ -126,13 +131,12 @@ function readOperand(masked: string, pos: number): Span | null {
   return end > start ? { start, end } : null;
 }
 
-/** El operando es aceptable para mover la función a su lado (sin subconsultas ni funciones no deterministas). */
 function safeOperand(maskedText: string, col: ColRef): boolean {
   if (/\(\s*SELECT\b|\bCASE\b|\bNEWID\s*\(|\bRAND\s*\(/i.test(maskedText)) return false;
   return !new RegExp('(^|[^\\w@#])' + escRe(col.col) + '\\b', 'i').test(maskedText);
 }
 
-/** La función está en un predicado (WHERE / ON / AND / OR / HAVING / NOT) y es el lado izquierdo de la comparación. */
+/** La posición está al inicio de una condición (WHERE / ON / AND / OR / HAVING / NOT). */
 function inPredicate(masked: string, idx: number): boolean {
   const before = masked.slice(Math.max(0, idx - 2000), idx);
   const ms = allMatches(/\b(WHERE|ON|AND|OR|HAVING|NOT|SELECT|SET|BY|THEN|ELSE|WHEN|CASE|INTO|FROM|VALUES|RETURN|DECLARE|IF|JOIN|BETWEEN|PRINT)\b/gi, before);
@@ -165,7 +169,6 @@ function addDays(p: YMD, k: number): YMD {
 const pad = (n: number) => String(n).padStart(2, '0');
 const lit = (p: YMD) => `'${p.y}${pad(p.m)}${pad(p.d)}'`;
 
-/** Tipos declarados de parámetros y variables (@x TIPO). */
 function declaredTypes(masked: string): Map<string, string> {
   const res = new Map<string, string>();
   for (const m of allMatches(/(@\w+)\s+(?:AS\s+)?(DATE|DATETIME2|DATETIME|SMALLDATETIME|DATETIMEOFFSET|INT|BIGINT|SMALLINT|TINYINT|DECIMAL|NUMERIC|N?VARCHAR|N?CHAR)\b/gi, masked)) {
@@ -176,7 +179,6 @@ function declaredTypes(masked: string): Map<string, string> {
 }
 const coversAll = (t: string) => { const o = t.indexOf('('); return o >= 0 && matchParen(t, o) === t.length - 1; };
 
-/** Operando de tipo DATE (sin hora): literal 'yyyymmdd', CONVERT(DATE, …), CAST(… AS DATE) o variable DATE. */
 function dateOperand(srcText: string, mText: string, decls: Map<string, string>): { start: string; next: string } | null {
   const d = parseDateLit(srcText);
   if (d) return { start: lit(d), next: lit(addDays(d, 1)) };
@@ -186,7 +188,6 @@ function dateOperand(srcText: string, mText: string, decls: Map<string, string>)
   return isDate ? { start: srcText, next: `DATEADD(DAY, 1, ${srcText})` } : null;
 }
 
-/** Inicio de año (o del siguiente) para YEAR(col): literal, YEAR(expr) o variable entera. */
 function yearOperand(srcText: string, mText: string, decls: Map<string, string>): { start: string; next: string } | null {
   if (/^\d{4}$/.test(mText)) {
     const y = +mText;
@@ -205,7 +206,6 @@ function yearOperand(srcText: string, mText: string, decls: Map<string, string>)
   return null;
 }
 
-/** Arma el rango para la relación "f(col) op X" sabiendo el inicio del periodo de X y el del periodo siguiente. */
 function rangeFor(col: string, op: string, start: string, next: string): string | null {
   switch (op) {
     case '=': return `(${col} >= ${start} AND ${col} < ${next})`;
@@ -221,10 +221,9 @@ const UNIT: Record<string, string> = { DAY: 'DAY', DD: 'DAY', D: 'DAY', MONTH: '
 const ADD_UNIT = /^(DAY|DD|D|HOUR|HH|MINUTE|MI|N|SECOND|SS|S|WEEK|WK|WW)$/i;
 const FLIP: Record<string, string> = { '=': '=', '<=': '>=', '<': '>', '>=': '<=', '>': '<' };
 
-// ---------------------------------------------------------------- reescritura
+// ---------------------------------------------------------------- lectura de comparaciones
 
-interface Cmp { op: string; a: Span; b?: Span; end: number; }
-/** Operador que sigue al cierre de la función y sus operandos. */
+/** FUNC(...) op X  |  FUNC(...) BETWEEN X AND Y */
 function readComparison(masked: string, close: number): Cmp | null {
   const m = /^\s*(>=|<=|<>|!=|=|>|<|BETWEEN\b)/i.exec(masked.slice(close + 1));
   if (!m) return null;
@@ -239,10 +238,36 @@ function readComparison(masked: string, close: number): Cmp | null {
   return b ? { op, a, b, end: b.end } : null;
 }
 
+/** X op FUNC(...)  (valor simple a la izquierda) → se normaliza como FUNC(...) op' X. Devuelve el inicio de X. */
+function readReversed(masked: string, fnIdx: number, close: number): { cmp: Cmp; start: number } | null {
+  const before = masked.slice(Math.max(0, fnIdx - 400), fnIdx);
+  const mm = /(@\w+|N?'[^']*'|-?\d+(?:\.\d+)?|(?:GETDATE|SYSDATETIME)\s*\(\s*\))\s*(>=|<=|=|>|<)\s*$/i.exec(before);
+  if (!mm) return null;
+  const leftStart = fnIdx - before.length + mm.index;
+  if (/[\w@#.\]]/.test(masked[leftStart - 1] || ' ')) return null;
+  if (mm[2] === '<' && /^</.test(masked.slice(leftStart + mm[1].length).trimStart())) return null;
+  if (!inPredicate(masked, leftStart)) return null;
+  // Después de la función debe terminar la condición (no aritmética ni otra comparación)
+  if (/^\s*(=|<|>|!|\+|-|\*|\/|%|\.|BETWEEN\b|IN\b|LIKE\b|IS\b|COLLATE\b)/i.test(masked.slice(close + 1))) return null;
+  const a = { start: leftStart, end: leftStart + mm[1].length };
+  return { cmp: { op: FLIP[mm[2]], a, end: close + 1 }, start: leftStart };
+}
+
+/** FUNC(...) IN ('a', 'b', …) */
+function readInList(masked: string, close: number): { items: Span[]; end: number } | null {
+  const m = /^\s*IN\s*\(/i.exec(masked.slice(close + 1));
+  if (!m) return null;
+  const open = close + 1 + m[0].length - 1, end = matchParen(masked, open);
+  if (end < 0) return null;
+  return { items: splitArgs(masked, open, end), end: end + 1 };
+}
+
 function digitsInc(s: string): string | null {
   const v = (BigInt(s) + 1n).toString().padStart(s.length, '0');
   return v.length === s.length ? v : null;
 }
+
+// ---------------------------------------------------------------- reescritura
 
 function collectEdits(src: string, masked: string, decls: Map<string, string>): Edit[] {
   const edits: Edit[] = [];
@@ -288,127 +313,152 @@ function collectEdits(src: string, masked: string, decls: Map<string, string>): 
     push(m.index, cmp2.end, `(${col.text} >= ${start} AND ${col.text} < ${next})`, 'YEAR + MONTH → rango del mes');
   }
 
-  // 2) Funciones sobre la columna en el lado izquierdo de la comparación
+  // 2) Funciones sobre la columna en una comparación (columna a la izquierda o a la derecha)
   for (const m of allMatches(/\b(SUBSTRING|LEFT|CONVERT|CAST|YEAR|DATEPART|DATEDIFF|DATEADD)\s*\(/gi, masked)) {
-    if (isCovered(m.index) || !inPredicate(masked, m.index)) continue;
+    if (isCovered(m.index)) continue;
     const fn = m[1].toUpperCase();
     const open = m.index + m[0].length - 1, close = matchParen(masked, open);
     if (close < 0) continue;
-    const cmp = readComparison(masked, close);
-    if (!cmp) continue;
-    const args = fn === 'CAST' ? [] : splitArgs(masked, open, close);
-    const opA = M(cmp.a), srcA = S(cmp.a);
-    const opB = cmp.b ? M(cmp.b) : '', srcB = cmp.b ? S(cmp.b) : '';
-    let text: string | null = null, rule = '';
+    const isStr = fn === 'SUBSTRING' || fn === 'LEFT';
 
-    if (fn === 'SUBSTRING' || fn === 'LEFT') {
-      // SUBSTRING(col, 1, n) / LEFT(col, n) con literal de n caracteres
-      const okArgs = fn === 'SUBSTRING' ? args.length === 3 && M(args[1]) === '1' && /^\d+$/.test(M(args[2]))
-        : args.length === 2 && /^\d+$/.test(M(args[1]));
+    let cmp: Cmp | null = null, inList: { items: Span[]; end: number } | null = null, editStart = m.index;
+    if (inPredicate(masked, m.index)) {
+      cmp = readComparison(masked, close);
+      if (!cmp && isStr) inList = readInList(masked, close);
+    } else {
+      const rv = readReversed(masked, m.index, close);
+      if (rv) { cmp = rv.cmp; editStart = rv.start; }
+    }
+    if (!cmp && !inList) continue;
+
+    const args = fn === 'CAST' ? [] : splitArgs(masked, open, close);
+    let text: string | null = null, rule = '', editEnd = cmp ? cmp.end : inList!.end;
+
+    if (isStr) {
+      // SUBSTRING(col, s, n) / LEFT(col, n)
+      const okArgs = fn === 'SUBSTRING' ? args.length === 3 && /^\d+$/.test(M(args[1])) && +M(args[1]) >= 1 && /^\d+$/.test(M(args[2])) && +M(args[2]) >= 1
+        : args.length === 2 && /^\d+$/.test(M(args[1])) && +M(args[1]) >= 1;
       const col = okArgs ? colRef(M(args[0])) : null;
       if (!col) continue;
+      const startPos = fn === 'SUBSTRING' ? +M(args[1]) : 1;
       const n = +M(args[args.length - 1]);
-      const litA = /^(N?)'([^']*)'$/i.exec(srcA);
-      if (cmp.op === '=' && litA && litA[2].length === n && !/[%_[]/.test(litA[2]) && !/ $/.test(litA[2])) {
-        text = `${col.text} LIKE ${litA[1]}'${litA[2]}%'`; rule = `${fn} → LIKE 'prefijo%'`;
-      } else {
-        const dA = /^N?'(\d+)'$/i.exec(srcA), dB = cmp.b ? /^N?'(\d+)'$/i.exec(srcB) : null;
+      if (startPos > 200) continue;
+      const pre = '_'.repeat(startPos - 1);
+      const likeOf = (litSrc: string): string | null => {
+        // Número sin comillas de n dígitos (SUBSTRING(c, 6, 3) = 305): solo '305' convierte a 305
+        const num = /^\d+$/.exec(litSrc.trim());
+        if (num) return num[0].length === n && (n === 1 || num[0][0] !== '0') ? `${col.text} LIKE '${pre}${num[0]}%'` : null;
+        const x = /^(N?)'([^']*)'$/i.exec(litSrc);
+        if (!x || x[2].length !== n || /[%_[\]]/.test(x[2]) || / $/.test(x[2])) return null;
+        return `${col.text} LIKE ${x[1]}'${pre}${x[2]}%'`;
+      };
+      const kind = startPos === 1 ? `${fn} → LIKE 'prefijo%' (permite Index Seek)` : `SUBSTRING(col, ${startPos}, ${n}) → LIKE '${pre}…%' (sin función sobre la columna)`;
+      if (inList) {
+        const parts = inList.items.map(it => likeOf(S(it)));
+        if (parts.length && parts.every(p => p)) {
+          text = parts.length === 1 ? parts[0]! : `(${parts.join(' OR ')})`;
+          rule = `${kind} · lista IN`;
+        }
+      } else if (cmp!.op === '=') {
+        const l = likeOf(S(cmp!.a));
+        if (l) { text = l; rule = kind; }
+      } else if (startPos === 1) {
+        const dA = /^N?'(\d+)'$/i.exec(S(cmp!.a)), dB = cmp!.b ? /^N?'(\d+)'$/i.exec(S(cmp!.b)) : null;
         const okLen = (x: RegExpExecArray | null) => !!x && x[1].length === n;
-        if (cmp.op === 'BETWEEN' && okLen(dA) && okLen(dB)) {
+        if (cmp!.op === 'BETWEEN' && okLen(dA) && okLen(dB)) {
           const inc = digitsInc(dB![1]);
           if (inc) { text = `(${col.text} >= '${dA![1]}' AND ${col.text} < '${inc}')`; rule = `${fn} BETWEEN → rango sobre la columna`; }
-        } else if (cmp.op !== 'BETWEEN' && okLen(dA)) {
+        } else if (cmp!.op !== 'BETWEEN' && okLen(dA)) {
           const inc = digitsInc(dA![1]);
-          const r = cmp.op === '>=' ? `${col.text} >= '${dA![1]}'` : cmp.op === '<' ? `${col.text} < '${dA![1]}'`
-            : inc && cmp.op === '<=' ? `${col.text} < '${inc}'` : inc && cmp.op === '>' ? `${col.text} >= '${inc}'` : null;
-          if (r) { text = r; rule = `${fn} ${cmp.op} → comparación sobre la columna`; }
+          const op = cmp!.op;
+          const r = op === '>=' ? `${col.text} >= '${dA![1]}'` : op === '<' ? `${col.text} < '${dA![1]}'`
+            : inc && op === '<=' ? `${col.text} < '${inc}'` : inc && op === '>' ? `${col.text} >= '${inc}'` : null;
+          if (r) { text = r; rule = `${fn} ${op} → comparación sobre la columna`; }
         }
       }
-    } else if (fn === 'CONVERT' || fn === 'CAST') {
-      let colTxt = '', target = '', style = '';
-      if (fn === 'CAST') {
-        const am = /^([\s\S]+?)\s+AS\s+([\s\S]+)$/i.exec(masked.slice(open + 1, close).trim());
-        if (!am) continue;
-        colTxt = am[1]; target = am[2].replace(/\s+/g, '').toUpperCase();
-      } else {
-        if (args.length < 2) continue;
-        target = M(args[0]).replace(/\s+/g, '').toUpperCase(); colTxt = M(args[1]); style = args[2] ? M(args[2]) : '';
-      }
-      const col = colRef(colTxt);
-      if (!col || !isDateCol(col)) continue;
-      if (target === 'DATE') {
-        // CONVERT(DATE, dCol) / CAST(dCol AS DATE) contra un valor DATE (sin hora)
-        if (!safeOperand(opA, col) || (cmp.b && !safeOperand(opB, col))) continue;
-        const a = dateOperand(srcA, opA, decls);
+    } else {
+      const c = cmp!;
+      const opA = M(c.a), srcA = S(c.a);
+      const opB = c.b ? M(c.b) : '', srcB = c.b ? S(c.b) : '';
+
+      if (fn === 'CONVERT' || fn === 'CAST') {
+        let colTxt = '', target = '', style = '';
+        if (fn === 'CAST') {
+          const am = /^([\s\S]+?)\s+AS\s+([\s\S]+)$/i.exec(masked.slice(open + 1, close).trim());
+          if (!am) continue;
+          colTxt = am[1]; target = am[2].replace(/\s+/g, '').toUpperCase();
+        } else {
+          if (args.length < 2) continue;
+          target = M(args[0]).replace(/\s+/g, '').toUpperCase(); colTxt = M(args[1]); style = args[2] ? M(args[2]) : '';
+        }
+        const col = colRef(colTxt);
+        if (!col || !isDateCol(col)) continue;
+        if (target === 'DATE') {
+          if (!safeOperand(opA, col) || (c.b && !safeOperand(opB, col))) continue;
+          const a = dateOperand(srcA, opA, decls);
+          if (!a) continue;
+          if (c.op === 'BETWEEN') {
+            const b = dateOperand(srcB, opB, decls);
+            if (b) { text = `(${col.text} >= ${a.start} AND ${col.text} < ${b.next})`; rule = `${fn}(DATE) BETWEEN → rango de fechas`; }
+          } else { text = rangeFor(col.text, c.op, a.start, a.next); rule = `${fn}(DATE) ${c.op} → rango de fechas`; }
+        } else {
+          const tm = /^N?(?:VAR)?CHAR\((8|10)\)$/.exec(target);
+          if (!tm || fn !== 'CONVERT') continue;
+          const compact = tm[1] === '8' && style === '112' ? true : tm[1] === '10' && /^(23|120|121|126)$/.test(style) ? false : null;
+          if (compact === null) continue;
+          const a = parseDateLit(srcA, compact);
+          if (!a) continue;
+          if (c.op === 'BETWEEN') {
+            const b = parseDateLit(srcB, compact);
+            if (b) { text = `(${col.text} >= ${lit(a)} AND ${col.text} < ${lit(addDays(b, 1))})`; rule = 'CONVERT(VARCHAR, fecha, estilo) BETWEEN → rango de fechas'; }
+          } else { text = rangeFor(col.text, c.op, lit(a), lit(addDays(a, 1))); rule = `CONVERT(VARCHAR, fecha, estilo) ${c.op} → rango de fechas`; }
+        }
+      } else if (fn === 'YEAR' || fn === 'DATEPART') {
+        let colTxt = '';
+        if (fn === 'YEAR') { if (args.length !== 1) continue; colTxt = M(args[0]); }
+        else { if (args.length !== 2 || !/^(YEAR|YY|YYYY)$/i.test(M(args[0]))) continue; colTxt = M(args[1]); }
+        const col = colRef(colTxt);
+        if (!col || !isDateCol(col) || !safeOperand(opA, col) || (c.b && !safeOperand(opB, col))) continue;
+        const a = yearOperand(srcA, opA, decls);
         if (!a) continue;
-        if (cmp.op === 'BETWEEN') {
-          const b = dateOperand(srcB, opB, decls);
-          if (b) { text = `(${col.text} >= ${a.start} AND ${col.text} < ${b.next})`; rule = `${fn}(DATE) BETWEEN → rango de fechas`; }
-        } else { text = rangeFor(col.text, cmp.op, a.start, a.next); rule = `${fn}(DATE) ${cmp.op} → rango de fechas`; }
-      } else {
-        // CONVERT(VARCHAR(8), dCol, 112) = 'yyyymmdd' | CONVERT(VARCHAR(10), dCol, 23|120|121) = 'yyyy-mm-dd'
-        const tm = /^N?(?:VAR)?CHAR\((8|10)\)$/.exec(target);
-        if (!tm || fn !== 'CONVERT') continue;
-        const compact = tm[1] === '8' && style === '112' ? true : tm[1] === '10' && /^(23|120|121|126)$/.test(style) ? false : null;
-        if (compact === null) continue;
-        const a = parseDateLit(srcA, compact);
-        if (!a) continue;
-        if (cmp.op === 'BETWEEN') {
-          const b = parseDateLit(srcB, compact);
-          if (b) { text = `(${col.text} >= ${lit(a)} AND ${col.text} < ${lit(addDays(b, 1))})`; rule = 'CONVERT(VARCHAR, fecha, estilo) BETWEEN → rango de fechas'; }
-        } else { text = rangeFor(col.text, cmp.op, lit(a), lit(addDays(a, 1))); rule = `CONVERT(VARCHAR, fecha, estilo) ${cmp.op} → rango de fechas`; }
+        if (c.op === 'BETWEEN') {
+          const b = yearOperand(srcB, opB, decls);
+          if (b) { text = `(${col.text} >= ${a.start} AND ${col.text} < ${b.next})`; rule = 'YEAR BETWEEN → rango de años con DATEADD'; }
+        } else { text = rangeFor(col.text, c.op, a.start, a.next); rule = `YEAR ${c.op} → rango del año con DATEADD`; }
+      } else if (fn === 'DATEDIFF') {
+        if (args.length !== 3 || c.op === 'BETWEEN' || !/^-?\d+$/.test(opA)) continue;
+        const unit = UNIT[M(args[0]).toUpperCase()];
+        if (!unit) continue;
+        const c1 = colRef(M(args[1])), c2 = colRef(M(args[2]));
+        const colFirst = !!c1 && isDateCol(c1) && !(c2 && isDateCol(c2));
+        const colSecond = !colFirst && !!c2 && isDateCol(c2);
+        if (!colFirst && !colSecond) continue;
+        const col = (colFirst ? c1 : c2)!;
+        const xSp = colFirst ? args[2] : args[1];
+        if (!safeOperand(M(xSp), col)) continue;
+        const X = S(xSp), N = +opA;
+        const rel = colFirst ? FLIP[c.op] : c.op;
+        const s = colFirst ? -N : N;
+        const B = (j: number) => `DATEADD(${unit}, DATEDIFF(${unit}, 0, ${X})${j ? (j > 0 ? ' + ' + j : ' - ' + (-j)) : ''}, 0)`;
+        text = rangeFor(col.text, rel, B(s), B(s + 1));
+        rule = `DATEDIFF(${unit}) ${c.op} ${N} → rango con DATEADD/DATEDIFF`;
+      } else if (fn === 'DATEADD') {
+        if (args.length !== 3 || !ADD_UNIT.test(M(args[0])) || !/^-?\d+$/.test(M(args[1]))) continue;
+        const col = colRef(M(args[2]));
+        if (!col || !isDateCol(col) || !safeOperand(opA, col) || (c.b && !safeOperand(opB, col))) continue;
+        const u = S(args[0]), n = -(+M(args[1]));
+        const shift = (x: string) => `DATEADD(${u}, ${n}, ${x})`;
+        text = c.op === 'BETWEEN' ? `${col.text} BETWEEN ${shift(srcA)} AND ${shift(srcB)}` : `${col.text} ${c.op} ${shift(srcA)}`;
+        rule = 'DATEADD sobre la columna → DATEADD sobre el valor';
       }
-    } else if (fn === 'YEAR' || fn === 'DATEPART') {
-      let colTxt = '';
-      if (fn === 'YEAR') { if (args.length !== 1) continue; colTxt = M(args[0]); }
-      else { if (args.length !== 2 || !/^(YEAR|YY|YYYY)$/i.test(M(args[0]))) continue; colTxt = M(args[1]); }
-      const col = colRef(colTxt);
-      if (!col || !isDateCol(col) || !safeOperand(opA, col) || (cmp.b && !safeOperand(opB, col))) continue;
-      const a = yearOperand(srcA, opA, decls);
-      if (!a) continue;
-      if (cmp.op === 'BETWEEN') {
-        const b = yearOperand(srcB, opB, decls);
-        if (b) { text = `(${col.text} >= ${a.start} AND ${col.text} < ${b.next})`; rule = 'YEAR BETWEEN → rango de años con DATEADD'; }
-      } else { text = rangeFor(col.text, cmp.op, a.start, a.next); rule = `YEAR ${cmp.op} → rango del año con DATEADD`; }
-    } else if (fn === 'DATEDIFF') {
-      // DATEDIFF(unidad, dCol, X) op N  |  DATEDIFF(unidad, X, dCol) op N
-      if (args.length !== 3 || cmp.op === 'BETWEEN' || !/^-?\d+$/.test(opA)) continue;
-      const unit = UNIT[M(args[0]).toUpperCase()];
-      if (!unit) continue;
-      const c1 = colRef(M(args[1])), c2 = colRef(M(args[2]));
-      const colFirst = !!c1 && isDateCol(c1) && !(c2 && isDateCol(c2));
-      const colSecond = !colFirst && !!c2 && isDateCol(c2);
-      if (!colFirst && !colSecond) continue;
-      const col = (colFirst ? c1 : c2)!;
-      const xSp = colFirst ? args[2] : args[1];
-      if (!safeOperand(M(xSp), col)) continue;
-      const X = S(xSp), N = +opA;
-      // idx(col) rel idx(X) + s
-      const rel = colFirst ? FLIP[cmp.op] : cmp.op;
-      const s = colFirst ? -N : N;
-      const B = (j: number) => `DATEADD(${unit}, DATEDIFF(${unit}, 0, ${X})${j ? (j > 0 ? ' + ' + j : ' - ' + (-j)) : ''}, 0)`;
-      text = rangeFor(col.text, rel, B(s), B(s + 1));
-      rule = `DATEDIFF(${unit}) ${cmp.op} ${N} → rango con DATEADD/DATEDIFF`;
-    } else if (fn === 'DATEADD') {
-      // DATEADD(DAY|HOUR|…, n, dCol) op X → dCol op DATEADD(…, -n, X)
-      if (args.length !== 3 || !ADD_UNIT.test(M(args[0])) || !/^-?\d+$/.test(M(args[1]))) continue;
-      const col = colRef(M(args[2]));
-      if (!col || !isDateCol(col) || !safeOperand(opA, col) || (cmp.b && !safeOperand(opB, col))) continue;
-      const u = S(args[0]), n = -(+M(args[1]));
-      const shift = (x: string) => `DATEADD(${u}, ${n}, ${x})`;
-      text = cmp.op === 'BETWEEN' ? `${col.text} BETWEEN ${shift(srcA)} AND ${shift(srcB)}` : `${col.text} ${cmp.op} ${shift(srcA)}`;
-      rule = 'DATEADD sobre la columna → DATEADD sobre el valor';
     }
 
-    if (text) push(m.index, cmp.end, text, rule);
+    if (text) push(editStart, editEnd, text, rule);
   }
   return edits;
 }
 
-/**
- * Reescribe los predicados no SARGables que tienen equivalente exacto.
- * Devuelve el código resultante, la cantidad de cambios y el detalle de cada uno.
- */
+/** Reescribe los predicados no SARGables que tienen equivalente exacto. */
 export function sargRewrite(src: string): SargResult {
   const changes: SargChange[] = [];
   let count = 0;
@@ -431,17 +481,13 @@ export function sargRewrite(src: string): SargResult {
 
 // ---------------------------------------------------------------- DML sobre temporales
 
-/**
- * ¿El INSERT/UPDATE/DELETE/MERGE que empieza en idx modifica una #temporal o @variable tabla?
- * Resuelve alias: UPDATE t SET … FROM #T t  /  DELETE d FROM #Det d …
- */
+/** ¿El INSERT/UPDATE/DELETE/MERGE que empieza en idx modifica una #temporal o @variable tabla? (resuelve alias) */
 export function dmlTargetIsTemp(masked: string, idx: number): boolean {
   const m = /^(UPDATE|DELETE|INSERT|MERGE)\s+(?:TOP\s*\([^)]*\)\s*(?:PERCENT\s+)?)?(?:(?:INTO|FROM)\s+)?((?:\[?[\w#@]+\]?\s*\.\s*)*\[?[#@]?\w+\]?)/i.exec(masked.slice(idx, idx + 600));
   if (!m) return false;
   const target = m[2].replace(/[\s[\]]/g, '');
   if (/^[#@]/.test(target)) return true;
   if (target.includes('.')) return false;
-  // Alias: buscarlo en el FROM/JOIN de la misma sentencia
   let region = masked.slice(idx + m[0].length, idx + 4000);
   const cut = region.search(/;|\n\s*(INSERT|UPDATE|DELETE|MERGE|COMMIT|ROLLBACK|END|IF|WHILE|DECLARE|EXEC|EXECUTE|DROP|CREATE|TRUNCATE|BEGIN)\b/i);
   if (cut >= 0) region = region.slice(0, cut);
@@ -449,10 +495,7 @@ export function dmlTargetIsTemp(masked: string, idx: number): boolean {
   return !!a && /^[#@]/.test(a[1].replace(/[\s[\]]/g, ''));
 }
 
-/**
- * Las transacciones del script solo modifican #temporales / @variables tabla (o no modifican nada):
- * en ese caso no se exige TRY/CATCH ni se envuelve la transacción. Si dentro hay EXEC de otro PA, no se asume.
- */
+/** Las transacciones del script solo modifican #temporales / @variables tabla (sin EXEC a otros PAs). */
 export function tranOnlyTemp(src: string): boolean {
   const masked = maskSql(src);
   const begins = allMatches(/\bBEGIN\s+TRAN(?:SACTION)?\b/gi, masked);
@@ -464,11 +507,57 @@ export function tranOnlyTemp(src: string): boolean {
     const off = b.index + b[0].length;
     if (/\bEXEC(?:UTE)?\b/i.test(body)) return false;
     for (const d of allMatches(/\b(INSERT|UPDATE|DELETE|MERGE)\b/gi, body)) {
-      const after = body.slice(d.index);
-      if (/^UPDATE\s+STATISTICS\b/i.test(after)) continue;
-      if (/\b(FOR|ON)\s*$/i.test(body.slice(Math.max(0, d.index - 6), d.index))) continue; // FOR UPDATE / ON DELETE
+      if (/^UPDATE\s+STATISTICS\b/i.test(body.slice(d.index))) continue;
+      if (/\b(FOR|ON)\s*$/i.test(body.slice(Math.max(0, d.index - 6), d.index))) continue;
       if (!dmlTargetIsTemp(masked, off + d.index)) return false;
     }
   }
   return true;
+}
+
+/** DML (INSERT/UPDATE/DELETE) sobre tablas físicas, sin contar #temporales ni @variables tabla. */
+export function physicalDml(src: string): number[] {
+  const masked = maskSql(src);
+  return allMatches(/\b(INSERT\s+INTO|UPDATE|DELETE\s+FROM|DELETE)\s+(?:\[?\w+\]?\.)*\[?[#@]?[A-Za-z]\w*/gi, masked)
+    .filter(m => !/^UPDATE\s+STATISTICS/i.test(m[0]))
+    .filter(m => !/\b(FOR|ON)\s*$/i.test(masked.slice(Math.max(0, m.index - 6), m.index)))
+    .filter(m => !dmlTargetIsTemp(masked, m.index))
+    .map(m => m.index);
+}
+
+// ---------------------------------------------------------------- pendientes (no reescritos)
+
+export interface SargPending { line: number; expr: string; reason: string; }
+
+/**
+ * Funciones sobre columnas en filtros que NO se reescribieron, con el motivo.
+ * Se usa para explicar en R10 qué queda para revisión manual.
+ */
+export function sargPending(src: string): SargPending[] {
+  const after = sargRewrite(src).src;
+  const masked = maskSql(after);
+  const out: SargPending[] = [];
+  for (const m of allMatches(/\b(SUBSTRING|LEFT|RIGHT|CONVERT|CAST|YEAR|MONTH|DAY|DATEPART|DATEDIFF|DATEADD|ISNULL|LTRIM|RTRIM|TRIM|UPPER|LOWER|REPLACE)\s*\(/gi, masked)) {
+    if (!inPredicate(masked, m.index)) continue;
+    const open = m.index + m[0].length - 1, close = matchParen(masked, open);
+    if (close < 0) continue;
+    const args = splitArgs(masked, open, close);
+    const hasCol = args.some(a => /^(?:\[?[A-Za-z_]\w*\]?\s*\.\s*)?\[?[A-Za-z_]\w*\]?$/.test(masked.slice(a.start, a.end)) && !/^(DAY|MONTH|YEAR|DD|MM|YY|YYYY|D|M|DATE|INT|HOUR|MINUTE|SECOND|WEEK|NULL|GETDATE)$/i.test(masked.slice(a.start, a.end)));
+    if (!hasCol) continue;
+    const opm = /^\s*(>=|<=|<>|!=|=|>|<|NOT\s+IN\b|IN\b|NOT\s+LIKE\b|LIKE\b|BETWEEN\b|IS\b)/i.exec(masked.slice(close + 1));
+    if (!opm) continue;
+    const op = opm[1].toUpperCase().replace(/\s+/g, ' ');
+    const rhs = readOperand(masked, close + 1 + opm[0].length);
+    const r = rhs ? masked.slice(rhs.start, rhs.end).trim() : '';
+    const fn = m[1].toUpperCase();
+    let reason: string;
+    if (op === '<>' || op === '!=' || op.startsWith('NOT')) reason = `negación (${op}): no tiene reescritura equivalente segura`;
+    else if (/^@\w+$/.test(r)) reason = `se compara con la variable ${r}: el resultado depende de su largo y contenido`;
+    else if (/^(?:\[?\w+\]?\s*\.\s*)\[?\w+\]?$/.test(r)) reason = `se compara con otra columna (${r}): no hay equivalente sin función`;
+    else if (/^(ISNULL|LTRIM|RTRIM|TRIM|UPPER|LOWER|REPLACE)$/.test(fn)) reason = `${fn} sobre la columna: reescribir a mano (p. ej. ISNULL(n, 0) = 0 → (n = 0 OR n IS NULL))`;
+    else if (/^(CONVERT|CAST|YEAR|MONTH|DAY|DATEPART|DATEDIFF|DATEADD)$/.test(fn)) reason = 'fecha sin equivalente exacto (columna sin prefijo d, variable DATETIME, unidad MONTH/YEAR en DATEADD u operando complejo)';
+    else reason = 'el valor no es un texto de exactamente n caracteres (o contiene % _ [ o espacio final)';
+    out.push({ line: lineOf(after, m.index), expr: after.slice(m.index, rhs ? Math.min(rhs.end, close + 160) : close + 1).replace(/\s+/g, ' ').trim(), reason });
+  }
+  return out;
 }
